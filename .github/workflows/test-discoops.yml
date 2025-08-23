@@ -1,3 +1,5 @@
+# File: .github/workflows/test-discoops.yml
+
 name: DiscoOps Tests
 
 on:
@@ -20,7 +22,7 @@ jobs:
         python-version: ['3.8', '3.9', '3.10', '3.11']
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v4
@@ -28,7 +30,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
     
     - name: Cache pip packages
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -65,7 +67,7 @@ jobs:
     
     - name: Upload coverage reports to Codecov
       if: matrix.python-version == '3.10'
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v4
       with:
         file: ./cogs/discoops/coverage.xml
         flags: unittests
@@ -117,7 +119,7 @@ jobs:
         bandit -r cogs/discoops/ -f json -o bandit-report.json || true
     
     - name: Upload Bandit Report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: bandit-security-report
