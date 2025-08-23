@@ -72,10 +72,16 @@ jobs:
         echo "Python version:"
         python --version
     
+    - name: Run simple import test
+      run: |
+        cd cogs/discoops
+        echo "Testing basic import..."
+        python test_simple.py || true
+    
     - name: Run unit tests
       run: |
         cd cogs/discoops
-        echo "Running tests..."
+        echo "Running full tests..."
         python -m unittest test_discoops -v || (echo "Test failed with exit code $?"; exit 1)
     
     - name: Upload coverage reports to Codecov
