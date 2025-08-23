@@ -63,10 +63,20 @@ jobs:
       run: |
         isort --check-only cogs/discoops/ || true
     
+    - name: Debug - Check file structure
+      run: |
+        echo "Current directory:"
+        pwd
+        echo "Files in cogs/discoops:"
+        ls -la cogs/discoops/ || echo "Directory not found"
+        echo "Python version:"
+        python --version
+    
     - name: Run unit tests
       run: |
         cd cogs/discoops
-        python -m pytest test_discoops.py -v --cov=discoops --cov-report=xml --cov-report=term || python -m unittest test_discoops.py -v
+        echo "Running tests..."
+        python -m unittest test_discoops -v || (echo "Test failed with exit code $?"; exit 1)
     
     - name: Upload coverage reports to Codecov
       if: matrix.python-version == '3.10'
