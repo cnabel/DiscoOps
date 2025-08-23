@@ -4,7 +4,7 @@ name: DiscoOps Tests
 
 on:
   push:
-    # branches: [ main, develop ]
+    branches: [ main, develop ]
     paths:
       - 'cogs/discoops/**'
       - '.github/workflows/test-discoops.yml'
