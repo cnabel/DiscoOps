@@ -7,11 +7,51 @@ Run this to debug import issues.
 
 import sys
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 print("Starting simple test...")
 print(f"Python version: {sys.version}")
 print(f"Current directory: {os.getcwd()}")
+
+# Create proper mock classes
+class MockConfig:
+    @staticmethod
+    def get_conf(cog, identifier):
+        mock_conf = MagicMock()
+        mock_conf.register_guild = Mock()
+        mock_conf.guild = Mock(return_value=MagicMock())
+        return mock_conf
+
+class MockCog:
+    def __init__(self, bot):
+        self.bot = bot
+
+class MockCommands:
+    Cog = MockCog
+    
+    @staticmethod
+    def group(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    
+    @staticmethod
+    def command(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    
+    @staticmethod
+    def guild_only():
+        def decorator(func):
+            return func
+        return decorator
+    
+    @staticmethod
+    def has_permissions(**perms):
+        def decorator(func):
+            return func
+        return decorator
 
 # Mock all discord and redbot modules
 print("Mocking discord and redbot modules...")
@@ -20,8 +60,8 @@ sys.modules['discord.ext'] = MagicMock()
 sys.modules['discord.ext.commands'] = MagicMock()
 sys.modules['redbot'] = MagicMock()
 sys.modules['redbot.core'] = MagicMock()
-sys.modules['redbot.core.commands'] = MagicMock()
-sys.modules['redbot.core.Config'] = MagicMock()
+sys.modules['redbot.core'].commands = MockCommands
+sys.modules['redbot.core'].Config = MockConfig
 
 try:
     print("Attempting to import DiscoOps...")
