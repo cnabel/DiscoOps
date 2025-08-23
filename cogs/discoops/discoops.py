@@ -4,12 +4,26 @@ try:
     import discord
     from redbot.core import commands, Config
 except ImportError as e:
-    # For testing purposes, create mock imports
+    # For testing purposes, create minimal mock imports
     import sys
     from unittest.mock import MagicMock
+    
+    # Create a basic Cog class for testing
+    class MockCog:
+        def __init__(self, bot):
+            self.bot = bot
+    
     discord = MagicMock()
-    commands = MagicMock()
     Config = MagicMock()
+    
+    # Create a mock commands module with a Cog base class
+    commands = MagicMock()
+    commands.Cog = MockCog
+    commands.group = lambda *a, **k: lambda f: f
+    commands.command = lambda *a, **k: lambda f: f
+    commands.guild_only = lambda: lambda f: f
+    commands.has_permissions = lambda **k: lambda f: f
+    
     print(f"Warning: Using mocked imports due to: {e}")
 
 from datetime import datetime, timedelta
