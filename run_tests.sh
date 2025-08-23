@@ -1,4 +1,5 @@
 #!/bin/bash
+# File: run_tests.sh
 
 # DiscoOps Test Runner Script
 # Run this locally to test the cog before pushing
