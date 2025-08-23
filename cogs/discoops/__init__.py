@@ -1,3 +1,5 @@
+# File: cogs/discoops/__init__.py
+
 """
 DiscoOps - Discord Red Bot Cog
 Operational features to make Discord server management easier.
