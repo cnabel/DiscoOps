@@ -1,3 +1,5 @@
+# File: cogs/discoops/discoops.py
+
 import discord
 from redbot.core import commands, Config
 from datetime import datetime, timedelta
