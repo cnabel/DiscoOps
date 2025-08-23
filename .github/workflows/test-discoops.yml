@@ -1,0 +1,124 @@
+name: DiscoOps Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'cogs/discoops/**'
+      - '.github/workflows/test-discoops.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'cogs/discoops/**'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install discord.py
+        pip install Red-DiscordBot
+        pip install pytest pytest-asyncio pytest-cov pytest-mock
+        pip install flake8 black isort
+        
+    - name: Lint with flake8
+      run: |
+        # Stop build if there are Python syntax errors or undefined names
+        flake8 cogs/discoops --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 cogs/discoops --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Check code formatting with black
+      run: |
+        black --check cogs/discoops/ || true
+    
+    - name: Check import sorting with isort
+      run: |
+        isort --check-only cogs/discoops/ || true
+    
+    - name: Run unit tests
+      run: |
+        cd cogs/discoops
+        python -m pytest test_discoops.py -v --cov=discoops --cov-report=xml --cov-report=term
+    
+    - name: Upload coverage reports to Codecov
+      if: matrix.python-version == '3.10'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./cogs/discoops/coverage.xml
+        flags: unittests
+        name: codecov-discoops
+        fail_ci_if_error: false
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install discord.py
+        pip install Red-DiscordBot
+        pip install pytest pytest-asyncio
+    
+    - name: Run integration tests
+      run: |
+        cd cogs/discoops
+        python -m pytest test_discoops.py::TestDiscoOpsIntegration -v
+    
+    - name: Test cog loading
+      run: |
+        python -c "
+        import sys
+        sys.path.insert(0, 'cogs/discoops')
+        from discoops import DiscoOps
+        print('✅ Cog imported successfully')
+        "
+
+  security-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Run Bandit Security Check
+      run: |
+        pip install bandit
+        bandit -r cogs/discoops/ -f json -o bandit-report.json || true
+    
+    - name: Upload Bandit Report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: bandit-security-report
+        path: bandit-report.json
