@@ -3,7 +3,7 @@
     "short": "Operational features for Discord server management",
     "description": "DiscoOps provides tools to manage Discord servers more efficiently, including tracking new members, analyzing roles, and managing event attendees with Discord's built-in scheduled events.",
     "author": [
-        "YourName"
+        "cnabel"
     ],
     "required_cogs": {},
     "requirements": [],
