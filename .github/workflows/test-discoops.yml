@@ -4,7 +4,7 @@ name: DiscoOps Tests
 
 on:
   push:
-    branches: [ main, develop ]
+    # branches: [ main, develop ]
     paths:
       - 'cogs/discoops/**'
       - '.github/workflows/test-discoops.yml'
@@ -41,12 +41,9 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install discord.py
-        pip install Red-DiscordBot
+        # Don't install discord.py or Red-DiscordBot for tests - we'll use mocks
         pip install pytest pytest-asyncio pytest-cov pytest-mock
         pip install flake8 black isort
-        # Install test requirements
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         
     - name: Lint with flake8
       run: |
