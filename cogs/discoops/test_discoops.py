@@ -1,21 +1,67 @@
 # File: cogs/discoops/test_discoops.py
 
 import unittest
-from unittest.mock import Mock, MagicMock, AsyncMock, patch
+from unittest.mock import Mock, MagicMock, AsyncMock, patch, create_autospec
 from datetime import datetime, timedelta
 import sys
 import os
 
-# Mock discord and redbot before importing the cog
+# Add the cog directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Create proper mock classes instead of MagicMock
+class MockConfig:
+    @staticmethod
+    def get_conf(cog, identifier):
+        mock_conf = MagicMock()
+        mock_conf.register_guild = Mock()
+        mock_conf.guild = Mock(return_value=MagicMock())
+        return mock_conf
+
+class MockCommands:
+    class Cog:
+        def __init__(self, bot):
+            self.bot = bot
+
+    class Context:
+        pass
+
+    @staticmethod
+    def group(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+    @staticmethod
+    def command(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+    @staticmethod
+    def guild_only():
+        def decorator(func):
+            return func
+        return decorator
+
+    @staticmethod
+    def has_permissions(**perms):
+        def decorator(func):
+            return func
+        return decorator
+
+# Mock the modules before importing
 sys.modules['discord'] = MagicMock()
 sys.modules['discord.ext'] = MagicMock()
 sys.modules['discord.ext.commands'] = MagicMock()
 sys.modules['redbot'] = MagicMock()
 sys.modules['redbot.core'] = MagicMock()
-sys.modules['redbot.core.commands'] = MagicMock()
-sys.modules['redbot.core.Config'] = MagicMock()
 
-# Now we can import the cog
+# Set up the specific mocks we need
+sys.modules['redbot.core'].commands = MockCommands
+sys.modules['redbot.core'].Config = MockConfig
+
+# Now import the cog
 from discoops import DiscoOps
 
 
@@ -28,10 +74,8 @@ class TestDiscoOps(unittest.TestCase):
         self.bot = Mock()
         self.bot.add_cog = AsyncMock()
         
-        # Mock Config
-        with patch('discoops.Config') as mock_config_class:
-            mock_config_class.get_conf.return_value = MagicMock()
-            self.cog = DiscoOps(self.bot)
+        # Create the cog
+        self.cog = DiscoOps(self.bot)
         
         # Mock context
         self.ctx = Mock()
@@ -78,21 +122,8 @@ class TestDiscoOpsAsync(unittest.IsolatedAsyncioTestCase):
         self.bot = Mock()
         self.bot.add_cog = AsyncMock()
         
-        # Mock Config
-        with patch('discoops.Config') as mock_config_class:
-            self.mock_config = MagicMock()
-            mock_config_class.get_conf.return_value = self.mock_config
-            
-            # Setup config methods
-            self.mock_config.register_guild = Mock()
-            self.mock_config.guild = Mock()
-            
-            # Create guild config mock
-            guild_config = MagicMock()
-            guild_config.event_roles = AsyncMock(return_value={})
-            self.mock_config.guild.return_value = guild_config
-            
-            self.cog = DiscoOps(self.bot)
+        # Create the cog
+        self.cog = DiscoOps(self.bot)
         
         # Mock context
         self.ctx = Mock()
@@ -158,6 +189,9 @@ class TestDiscoOpsSetup(unittest.IsolatedAsyncioTestCase):
         await setup(bot)
         
         bot.add_cog.assert_called_once()
+        # Check that a DiscoOps instance was passed
+        call_args = bot.add_cog.call_args[0]
+        self.assertIsInstance(call_args[0], DiscoOps)
 
 
 if __name__ == '__main__':
