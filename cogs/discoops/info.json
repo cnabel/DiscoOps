@@ -1,0 +1,30 @@
+{
+    "name": "DiscoOps",
+    "short": "Operational features for Discord server management",
+    "description": "DiscoOps provides tools to manage Discord servers more efficiently, including tracking new members, analyzing roles, and managing event attendees with Discord's built-in scheduled events.",
+    "author": [
+        "YourName"
+    ],
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "management",
+        "administration",
+        "events",
+        "roles",
+        "members",
+        "utility",
+        "moderation"
+    ],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "permissions": [
+        "manage_roles",
+        "manage_guild",
+        "view_guild_insights"
+    ],
+    "install_msg": "Thank you for installing DiscoOps! Use `[p]help DiscoOps` or `[p]do help` to get started.\n\n**Key Features:**\n• Track recently joined members\n• Analyze role membership\n• Manage Discord scheduled events\n• Create and sync event roles\n\n**Required Permissions:**\nThe bot needs 'Manage Roles' permission to create/manage event roles.\n\n**Quick Start:**\n`[p]do members new 7 days` - See new members\n`[p]do events list` - List all events\n`[p]do help` - Full command list",
+    "end_user_data_statement": "This cog stores Discord event role mappings per guild. It does not store any personal user data. To delete the data, unload the cog and reset the config."
+}
