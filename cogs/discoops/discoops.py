@@ -13,13 +13,30 @@ except ImportError as e:
         def __init__(self, bot):
             self.bot = bot
     
+    # Create mock command group class
+    class MockGroup:
+        def __init__(self, *args, **kwargs):
+            pass
+        
+        def command(self, *args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+        
+        def group(self, *args, **kwargs):
+            def decorator(func):
+                func.command = self.command
+                func.group = self.group
+                return func
+            return decorator
+    
     discord = MagicMock()
     Config = MagicMock()
     
     # Create a mock commands module with a Cog base class
     commands = MagicMock()
     commands.Cog = MockCog
-    commands.group = lambda *a, **k: lambda f: f
+    commands.group = lambda *a, **k: lambda f: MockGroup()
     commands.command = lambda *a, **k: lambda f: f
     commands.guild_only = lambda: lambda f: f
     commands.has_permissions = lambda **k: lambda f: f
