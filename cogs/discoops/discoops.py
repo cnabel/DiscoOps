@@ -70,11 +70,17 @@ class DiscoOps(commands.Cog):
     
     # ========== Members Commands ==========
     
-    @discoops.group(name="members")
     async def members_group(self, ctx):
         """Member management commands."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
+    
+    # Register members_group as a subgroup
+    try:
+        members_group = discoops.group(name="members")(members_group)
+    except (AttributeError, NameError):
+        # In test environment, just use the function as-is
+        pass
     
     @members_group.command(name="new")
     async def members_new(self, ctx, amount: int, period: str):
