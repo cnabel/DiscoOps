@@ -3,6 +3,7 @@
 try:
     import discord
     from redbot.core import commands, Config
+    TESTING = False
 except ImportError as e:
     # For testing purposes, create minimal mock imports
     import sys
@@ -13,76 +14,49 @@ except ImportError as e:
         def __init__(self, bot):
             self.bot = bot
     
-    # Create mock command group class
-    class MockGroup:
-        def __init__(self, *args, **kwargs):
-            pass
-        
-        def command(self, *args, **kwargs):
-            def decorator(func):
-                return func
-            return decorator
-        
-        def group(self, *args, **kwargs):
-            def decorator(func):
-                func.command = self.command
-                func.group = self.group
-                return func
-            return decorator
-    
     discord = MagicMock()
     Config = MagicMock()
     
     # Create a mock commands module with a Cog base class
     commands = MagicMock()
     commands.Cog = MockCog
-    commands.group = lambda *a, **k: lambda f: MockGroup()
-    commands.command = lambda *a, **k: lambda f: f
-    commands.guild_only = lambda: lambda f: f
-    commands.has_permissions = lambda **k: lambda f: f
     
+    TESTING = True
     print(f"Warning: Using mocked imports due to: {e}")
 
 from datetime import datetime, timedelta
 import asyncio
 from typing import Optional, Union
 
+
 class DiscoOps(commands.Cog):
     """Operational features to make Discord server management easier."""
     
     def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=260288776360820736)
-        
-        # Initialize default guild settings for event role tracking
-        default_guild = {
-            "event_roles": {}  # Maps event_id to role_id
-        }
-        self.config.register_guild(**default_guild)
+        if not TESTING:
+            self.config = Config.get_conf(self, identifier=260288776360820736)
+            
+            # Initialize default guild settings for event role tracking
+            default_guild = {
+                "event_roles": {}  # Maps event_id to role_id
+            }
+            self.config.register_guild(**default_guild)
+        else:
+            # Mock config for testing
+            self.config = MagicMock()
     
-    @commands.group(name="do", aliases=["discoops"])
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
+    # Define all the command methods without decorators first
     async def discoops(self, ctx):
         """DiscoOps main command group."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
-    
-    # ========== Members Commands ==========
     
     async def members_group(self, ctx):
         """Member management commands."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
     
-    # Register members_group as a subgroup
-    try:
-        members_group = discoops.group(name="members")(members_group)
-    except (AttributeError, NameError):
-        # In test environment, just use the function as-is
-        pass
-    
-    @members_group.command(name="new")
     async def members_new(self, ctx, amount: int, period: str):
         """
         List members who joined in the last X days/weeks/months.
@@ -140,7 +114,6 @@ class DiscoOps(commands.Cog):
         
         await ctx.send(embed=embed)
     
-    @members_group.command(name="role")
     async def members_role(self, ctx, *, role: discord.Role):
         """
         List all members with a specific role and show count.
@@ -193,15 +166,11 @@ class DiscoOps(commands.Cog):
         
         await ctx.send(embed=embed)
     
-    # ========== Events Commands (Using Discord's Scheduled Events) ==========
-    
-    @discoops.group(name="events")
     async def events_group(self, ctx):
         """Event management commands for Discord Scheduled Events."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
     
-    @events_group.command(name="list")
     async def events_list(self, ctx):
         """List all scheduled events with name and description."""
         # Get all scheduled events from the guild
@@ -259,7 +228,6 @@ class DiscoOps(commands.Cog):
         
         await ctx.send(embed=embed)
     
-    @events_group.command(name="members")
     async def events_members(self, ctx, *, event_name: str):
         """
         List members who are interested in a specific event.
@@ -342,7 +310,6 @@ class DiscoOps(commands.Cog):
         
         await ctx.send(embed=embed)
     
-    @events_group.command(name="role")
     async def events_role(self, ctx, action: str, *, event_name: str):
         """
         Create, sync, or delete a role for event attendees.
@@ -488,7 +455,6 @@ class DiscoOps(commands.Cog):
             async with self.config.guild(ctx.guild).event_roles() as roles:
                 del roles[event_id_str]
     
-    @discoops.command(name="help")
     async def discoops_help(self, ctx):
         """Show detailed help for DiscoOps commands."""
         embed = discord.Embed(
@@ -539,6 +505,31 @@ class DiscoOps(commands.Cog):
         
         embed.set_footer(text="Replace [p] with your bot's prefix | Aliases: [p]do or [p]discoops")
         await ctx.send(embed=embed)
+
+
+# Only apply decorators if not in testing mode
+if not TESTING:
+    # Apply decorators to the main command
+    DiscoOps.discoops = commands.group(name="do", aliases=["discoops"])(DiscoOps.discoops)
+    DiscoOps.discoops = commands.guild_only()(DiscoOps.discoops)
+    DiscoOps.discoops = commands.has_permissions(manage_guild=True)(DiscoOps.discoops)
+    
+    # Apply decorators to subgroups
+    DiscoOps.members_group = DiscoOps.discoops.group(name="members")(DiscoOps.members_group)
+    DiscoOps.events_group = DiscoOps.discoops.group(name="events")(DiscoOps.events_group)
+    
+    # Apply decorators to members commands
+    DiscoOps.members_new = DiscoOps.members_group.command(name="new")(DiscoOps.members_new)
+    DiscoOps.members_role = DiscoOps.members_group.command(name="role")(DiscoOps.members_role)
+    
+    # Apply decorators to events commands
+    DiscoOps.events_list = DiscoOps.events_group.command(name="list")(DiscoOps.events_list)
+    DiscoOps.events_members = DiscoOps.events_group.command(name="members")(DiscoOps.events_members)
+    DiscoOps.events_role = DiscoOps.events_group.command(name="role")(DiscoOps.events_role)
+    
+    # Apply decorator to help command
+    DiscoOps.discoops_help = DiscoOps.discoops.command(name="help")(DiscoOps.discoops_help)
+
 
 async def setup(bot):
     await bot.add_cog(DiscoOps(bot))
