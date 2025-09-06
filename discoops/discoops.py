@@ -42,18 +42,16 @@ class DiscoOps(commands.Cog):
         if s is None:
             return ""
         s = unicodedata.normalize("NFKC", s).strip()
-        s = s.strip(' "\'“”‘’')  # remove surrounding quotes if present
+        s = s.strip(' "\'“”‘’')
         return s.casefold()
 
     @staticmethod
     def _event_match(events: List[discord.ScheduledEvent], query: str) -> Optional[discord.ScheduledEvent]:
         """Find event by normalized exact name, then partial match."""
         nq = DiscoOps._norm_text(query)
-        # exact match
         for e in events:
             if DiscoOps._norm_text(e.name) == nq:
                 return e
-        # partial match
         for e in events:
             if nq in DiscoOps._norm_text(e.name):
                 return e
@@ -101,17 +99,17 @@ class DiscoOps(commands.Cog):
         else:  # months (approximate)
             delta = timedelta(days=amount * 30)
 
-        # Make cutoff tz-aware (UTC) to avoid naive/aware comparison errors
+        # tz-aware (UTC) to avoid naive/aware comparison errors
         cutoff_date = datetime.now(timezone.utc) - delta
 
-        # Try to access members; this needs the Server Members Intent
+        # Access members (requires Server Members Intent)
         try:
             members = list(ctx.guild.members)
             if not members:
                 try:
                     await ctx.guild.chunk()
                     members = list(ctx.guild.members)
-                except Exception as e:
+                except Exception:
                     pass
         except Exception as e:
             members = []
@@ -125,14 +123,13 @@ class DiscoOps(commands.Cog):
             self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
             return
 
-        # Filter recent members (handle tz-awareness defensively)
+        # Filter recent members (tz-awareness)
         try:
             recent_members = []
             for m in members:
                 ja = getattr(m, "joined_at", None)
                 if not ja:
                     continue
-                # Ensure tz-aware UTC for joined_at
                 if ja.tzinfo is None:
                     ja = ja.replace(tzinfo=timezone.utc)
                 if ja > cutoff_date:
@@ -150,21 +147,23 @@ class DiscoOps(commands.Cog):
             self.log_info("No recent members found")
             return
 
-        # Create embed with results
+        # README-like embed (no emojis)
         embed = discord.Embed(
-            title=f"New Members - Last {amount} {period_l}",
+            title="New Members",
             color=discord.Color.blue(),
-            description=f"Found {len(recent_members)} member(s)"
+            description=f"**Range:** last **{amount} {period_l}**  •  **Found:** {len(recent_members)}"
         )
 
-        # Add members to embed (limit to 25 fields)
-        for i, (member, ja) in enumerate(recent_members[:25]):
-            join_date = ja.strftime("%Y-%m-%d %H:%M UTC")
-            days_ago = (datetime.now(timezone.utc) - ja).days
+        for i, (member, ja) in enumerate(recent_members[:25], start=1):
+            epoch = int(ja.timestamp())
+            lines = [
+                f"- **ID:** {member.id}",
+                f"- **Joined:** <t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)",
+            ]
             embed.add_field(
-                name=f"{i+1}. {member.display_name}",
-                value=f"ID: {member.id}\nJoined: {join_date}\n({days_ago} days ago)",
-                inline=True
+                name=f"{i}. {member.display_name}",
+                value="\n".join(lines),
+                inline=False
             )
 
         if len(recent_members) > 25:
@@ -175,19 +174,14 @@ class DiscoOps(commands.Cog):
 
     @members_group.command(name="role")
     async def members_role(self, ctx, *, role: discord.Role):
-        """
-        List all members with a specific role and show count.
-
-        Usage: [p]do members role <@role>
-        Example: [p]do members role @Moderator
-        """
+        """List all members with a specific role and show count."""
         self.log_info(f"{ctx.author} invoked 'members role' for role {role.id} in guild {ctx.guild.id}")
         members_with_role = role.members
 
         embed = discord.Embed(
             title=f"Members with role: {role.name}",
             color=role.color if role.color != discord.Color.default() else discord.Color.blue(),
-            description=f"**Total: {len(members_with_role)} member(s)**"
+            description=f"**Total:** {len(members_with_role)}"
         )
 
         if not members_with_role:
@@ -197,135 +191,120 @@ class DiscoOps(commands.Cog):
                 inline=False
             )
         else:
-            # Create member list
             member_list = []
             for i, member in enumerate(members_with_role[:50], 1):
                 member_list.append(f"{i}. {member.mention} ({member.display_name})")
-
-            # Split into chunks if needed
             chunk_size = 10
             for i in range(0, len(member_list), chunk_size):
                 chunk = member_list[i:i + chunk_size]
                 embed.add_field(
-                    name=f"Members {i+1}-{min(i+chunk_size, len(member_list))}",
+                    name=f"{i+1}-{min(i+chunk_size, len(member_list))}",
                     value="\n".join(chunk),
                     inline=False
                 )
-
             if len(members_with_role) > 50:
                 embed.set_footer(text=f"Showing first 50 of {len(members_with_role)} members")
 
-        # Add role information
         embed.add_field(
-            name="📊 Role Statistics",
-            value=f"Created: {role.created_at.strftime('%Y-%m-%d')}\n"
-                  f"Position: {role.position}\n"
-                  f"Mentionable: {'Yes' if role.mentionable else 'No'}\n"
-                  f"Color: {str(role.color)}",
+            name="Role Info",
+            value=(
+                f"- **Created:** {role.created_at.strftime('%Y-%m-%d')}\n"
+                f"- **Position:** {role.position}\n"
+                f"- **Mentionable:** {'Yes' if role.mentionable else 'No'}\n"
+                f"- **Color:** {str(role.color)}"
+            ),
             inline=False
         )
 
         await ctx.send(embed=embed)
         self.log_info(f"Sent members-with-role list ({len(members_with_role)} members)")
 
-    # ========== Events Commands (Using Discord's Scheduled Events) ==========
+    # ========== Event Commands (Using Discord's Scheduled Events) ==========
 
-    @discoops.group(name="events")
-    async def events_group(self, ctx):
-        """Event management commands for Discord Scheduled Events."""
-        if ctx.invoked_subcommand is None:
+    @discoops.group(name="event", aliases=["events"], invoke_without_command=True)
+    async def event_group(self, ctx, *, event_name: Optional[str] = None):
+        """
+        Event management commands for Discord Scheduled Events.
+
+        - `[p]do event list` — list scheduled events
+        - `[p]do event "Name"` — show summary + interested members for that event
+        (Alias: `events` kept for backward compatibility.)
+        """
+        if event_name:
+            # Treat providing a name directly as the "info" use case with member list
+            await self._event_info_with_members(ctx, event_name)
+        else:
             await ctx.send_help(ctx.command)
 
-    @events_group.command(name="list")
-    async def events_list(self, ctx):
-        """List all scheduled events with name and description."""
+    @event_group.command(name="list", aliases=["ls"])
+    async def event_list(self, ctx):
+        """List all scheduled events with name and description (README style)."""
         events: List[discord.ScheduledEvent] = await ctx.guild.fetch_scheduled_events(with_counts=True)
-
         if not events:
             await ctx.send("No scheduled events found in this server.")
             return
 
-        # sort by start time (earliest first); put None at the end
         far_future = datetime.max.replace(tzinfo=timezone.utc)
         events.sort(key=lambda e: e.start_time or far_future)
 
         embed = discord.Embed(
-            title="📅 Scheduled Events",
+            title="Scheduled Events",
             color=discord.Color.green(),
-            description=f"Total: {len(events)} event(s)"
+            description=f"**Total:** {len(events)}"
         )
 
         for event in events:
-            # Status badge
-            if event.status == discord.EventStatus.scheduled:
-                status_emoji = "🔔"
-                status = "Scheduled"
-            elif event.status == discord.EventStatus.active:
-                status_emoji = "🟢"
-                status = "Active"
-            elif event.status == discord.EventStatus.completed:
-                status_emoji = "✅"
-                status = "Completed"
-            else:  # cancelled
-                status_emoji = "❌"
-                status = "Cancelled"
-
+            status = event.status.name.title()
             user_count = event.user_count or 0
 
-            # Time formatting (Discord timestamp + raw epoch)
             if event.start_time:
                 epoch = int(event.start_time.replace(tzinfo=event.start_time.tzinfo or timezone.utc).timestamp())
-                discord_time = f"<t:{epoch}:F> • <t:{epoch}:R>"
-                unix_time = f"`{epoch}`"
-                start_line = f"{discord_time} (unix: {unix_time})"
+                start_line = f"<t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
             else:
                 start_line = "N/A"
 
-            # Field content (copy-friendly name + quick command)
-            field_value = (
-                f"**Name:** `{event.name}`\n"
-                f"**Status:** {status_emoji} {status}\n"
-                f"**Start:** {start_line}\n"
-                f"**Interested:** {user_count} users\n"
-                f"**Quick command:** `[p]do events members \"{event.name}\"`\n"
-            )
+            lines = [
+                f"- **Name:** `{event.name}`",
+                f"- **Status:** {status}",
+                f"- **Start:** {start_line}",
+                f"- **Interested:** {user_count}",
+                f"- **Quick command:** `[p]do event \"{event.name}\"`",
+            ]
 
             if event.description:
                 desc = event.description[:200] + "..." if len(event.description) > 200 else event.description
-                field_value += f"**Description:** {desc}\n"
+                lines.append(f"- **Description:** {desc}")
 
             if event.location:
-                field_value += f"**Location:** {event.location}\n"
+                lines.append(f"- **Location:** {event.location}")
             elif event.channel:
-                field_value += f"**Channel:** {event.channel.mention}\n"
+                lines.append(f"- **Channel:** {event.channel.mention}")
 
             embed.add_field(
-                name=f"{status_emoji} {event.name}",
-                value=field_value,
+                name=f"{event.name}",
+                value="\n".join(lines),
                 inline=False
             )
 
         await ctx.send(embed=embed)
         self.log_info(f"{ctx.author} listed events in guild {ctx.guild.id}")
 
-    @events_group.command(name="members")
-    async def events_members(self, ctx, *, event_name: str):
-        """
-        List members who are interested in a specific event.
+    @event_group.command(name="members")  # deprecated path, kept for compatibility
+    async def event_members_legacy(self, ctx, *, event_name: str):
+        """[Deprecated] Use: `[p]do event "Name"` instead."""
+        await ctx.send("`members` is deprecated. Use: `[p]do event \"Event Name\"`.\nShowing the info below:")
+        await self._event_info_with_members(ctx, event_name)
 
-        Usage: [p]do events members <event_name>
-        """
+    async def _event_info_with_members(self, ctx, event_name: str):
+        """Show one event summary (like list) + interested members."""
         events = await ctx.guild.fetch_scheduled_events(with_counts=True)
-
-        # Normalize and match (handles quotes/diacritics)
         event = self._event_match(events, event_name)
-
         if not event:
-            await ctx.send(f"Event '{event_name}' not found. Use `[p]do events list` to see all events.")
-            self.log_info(f"events members: not found for query={event_name!r}")
+            await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
+            self.log_info(f"event info: not found for query={event_name!r}")
             return
 
-        # Fetch users interested in the event
+        # Collect users
         try:
             interested_users = []
             async for user in event.users():
@@ -337,66 +316,74 @@ class DiscoOps(commands.Cog):
             self.log_info(f"Error fetching users for event {event.id}: {e}")
             return
 
-        if not interested_users:
-            await ctx.send(f"No members are marked as interested in **{event.name}**")
-            return
-
+        # Build README-like embed
         embed = discord.Embed(
-            title=f"📋 Interested in: {event.name}",
-            color=discord.Color.blue(),
-            description=f"**Total: {len(interested_users)} member(s)**"
+            title=f"Event: {event.name}",
+            color=discord.Color.blue()
         )
 
-        if event.description:
-            embed.add_field(
-                name="Event Description",
-                value=event.description[:1024],
-                inline=False
-            )
-
+        status = event.status.name.title()
         if event.start_time:
-            epoch = int(event.start_time.timestamp())
+            epoch = int(event.start_time.replace(tzinfo=event.start_time.tzinfo or timezone.utc).timestamp())
             start_line = f"<t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
         else:
             start_line = "N/A"
 
+        user_count = event.user_count or 0
+
+        summary_lines = [
+            f"- **Name:** `{event.name}`",
+            f"- **Status:** {status}",
+            f"- **Start:** {start_line}",
+            f"- **Interested:** {user_count}",
+        ]
+        if event.description:
+            summary_lines.append(f"- **Description:** {event.description[:1024]}")
+        if event.location:
+            summary_lines.append(f"- **Location:** {event.location}")
+        elif event.channel:
+            summary_lines.append(f"- **Channel:** {event.channel.mention}")
+
+        summary_lines.append(f"- **Role commands:** `[p]do event role create \"{event.name}\"`, "
+                             f"`[p]do event role sync \"{event.name}\"`, "
+                             f"`[p]do event role delete \"{event.name}\"`")
+
         embed.add_field(
-            name="Event Details",
-            value=(
-                f"**Name:** `{event.name}`\n"
-                f"**Start:** {start_line}\n"
-                f"**Status:** {event.status.name}\n"
-                f"**Quick command:** `[p]do events members \"{event.name}\"`"
-            ),
+            name="Summary",
+            value="\n".join(summary_lines),
             inline=False
         )
 
-        # List interested members
-        member_list = []
-        for i, member in enumerate(interested_users[:50], 1):
-            member_list.append(f"{i}. {member.mention} ({member.display_name})")
-
-        chunk_size = 15
-        for i in range(0, len(member_list), chunk_size):
-            chunk = member_list[i:i + chunk_size]
+        # Interested members list
+        if interested_users:
+            member_lines = []
+            for i, member in enumerate(interested_users[:50], start=1):
+                member_lines.append(f"{i}. {member.mention} ({member.display_name})")
+            chunk_size = 15
+            for i in range(0, len(member_lines), chunk_size):
+                chunk = member_lines[i:i + chunk_size]
+                embed.add_field(
+                    name=f"Interested Members {i+1}-{min(i+chunk_size, len(member_lines))}",
+                    value="\n".join(chunk),
+                    inline=False
+                )
+            if len(interested_users) > 50:
+                embed.set_footer(text=f"Showing first 50 of {len(interested_users)} interested members")
+        else:
             embed.add_field(
-                name=f"Interested Members ({i+1}-{min(i+chunk_size, len(member_list))})",
-                value="\n".join(chunk),
+                name="Interested Members",
+                value="None",
                 inline=False
             )
 
-        if len(interested_users) > 50:
-            embed.set_footer(text=f"Showing first 50 of {len(interested_users)} members")
-
         await ctx.send(embed=embed)
-        self.log_info(f"{ctx.author} listed interested members for event {event.id} in guild {ctx.guild.id}")
+        self.log_info(f"{ctx.author} viewed event info for {event.id} in guild {ctx.guild.id}")
 
-    @events_group.command(name="role")
-    async def events_role(self, ctx, action: str, *, event_name: str):
+    @event_group.command(name="role")
+    async def event_role(self, ctx, action: str, *, event_name: str):
         """
         Create, sync, or delete a role for event attendees.
-
-        Usage: [p]do events role <create|sync|delete> <event_name>
+        Usage: [p]do event role <create|sync|delete> <event_name>
         """
         action = (action or "").lower()
         if action not in ['create', 'sync', 'delete']:
@@ -405,13 +392,12 @@ class DiscoOps(commands.Cog):
 
         events = await ctx.guild.fetch_scheduled_events(with_counts=True)
         event = self._event_match(events, event_name)
-
         if not event:
-            await ctx.send(f"Event '{event_name}' not found. Use `[p]do events list` to see all events.")
-            self.log_info(f"events role: not found for query={event_name!r}")
+            await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
+            self.log_info(f"event role: not found for query={event_name!r}")
             return
 
-        # Get interested users
+        # Interested users
         interested_users = []
         try:
             async for user in event.users():
@@ -448,10 +434,10 @@ class DiscoOps(commands.Cog):
                         added += 1
                     except discord.Forbidden:
                         pass
-                await ctx.send(f"✅ Created role {role.mention} and added to {added} interested members")
+                await ctx.send(f"Created role {role.mention} and added to {added} interested members")
                 self.log_info(f"Created role {role.id} for event {event.id} in guild {ctx.guild.id}")
             except discord.Forbidden:
-                await ctx.send("❌ I don't have permission to create roles!")
+                await ctx.send("I don't have permission to create roles.")
                 return
 
         elif action == "sync":
@@ -489,7 +475,7 @@ class DiscoOps(commands.Cog):
                     except discord.Forbidden:
                         pass
 
-            await ctx.send(f"✅ Sync complete for {role.mention}!\nAdded: {added} members\nRemoved: {removed} members")
+            await ctx.send(f"Sync complete for {role.mention} — Added: {added} • Removed: {removed}")
             self.log_info(f"Synced role {role.id} for event {event.id} in guild {ctx.guild.id}: +{added}/-{removed}")
 
         elif action == "delete":
@@ -500,9 +486,9 @@ class DiscoOps(commands.Cog):
             if role:
                 try:
                     await role.delete(reason=f"Event role deleted by {ctx.author}")
-                    await ctx.send(f"✅ Deleted role for event **{event.name}**")
+                    await ctx.send(f"Deleted role for event **{event.name}**")
                 except discord.Forbidden:
-                    await ctx.send("❌ I don't have permission to delete this role!")
+                    await ctx.send("I don't have permission to delete this role.")
                     return
             async with self.config.guild(ctx.guild).event_roles() as roles:
                 del roles[event_id_str]
@@ -522,7 +508,7 @@ class DiscoOps(commands.Cog):
         lines = list(self.logs)[-count:]
         content = "\n".join(lines)
         embed = discord.Embed(
-            title=f"🧾 DiscoOps Logs (last {len(lines)})",
+            title="DiscoOps Logs",
             description=f"```\n{content}\n```",
             color=discord.Color.dark_grey()
         )
@@ -535,7 +521,7 @@ class DiscoOps(commands.Cog):
         g = ctx.guild
         me = g.me
         perms = g.me.guild_permissions
-        embed = discord.Embed(title="🐞 DiscoOps Debug", color=discord.Color.orange())
+        embed = discord.Embed(title="DiscoOps Debug", color=discord.Color.orange())
         embed.add_field(
             name="Guild",
             value=f"Name: {g.name}\nID: {g.id}\nMembers: {g.member_count}",
@@ -564,71 +550,53 @@ class DiscoOps(commands.Cog):
     async def discoops_clearlogs(self, ctx):
         """Clear all stored logs."""
         self.logs.clear()
-        await ctx.send("✅ Logs cleared.")
+        await ctx.send("Logs cleared.")
         self.log_info(f"Logs cleared by {ctx.author}")
 
     @discoops.command(name="help")
     async def discoops_help(self, ctx):
         """Show detailed help for DiscoOps commands."""
         embed = discord.Embed(
-            title="🛠️ DiscoOps Help",
+            title="DiscoOps Help",
             description="Operational features for Discord server management",
-            color=0x3498db  # Blue color in hex
+            color=0x3498db
         )
-
         embed.add_field(
-            name="📊 Member Commands",
-            value="`[p]do members new <amount> <days/weeks/months>`\n"
-                  "→ List members who joined recently\n"
-                  "Example: `[p]do members new 7 days`\n\n"
-                  "`[p]do members role <@role>`\n"
-                  "→ List members with a role and show count\n"
-                  "Example: `[p]do members role @Moderator`",
+            name="Member Commands",
+            value=(
+                "`[p]do members new <amount> <days|weeks|months>`\n"
+                "→ List members who joined recently\n"
+                "Example: `[p]do members new 7 days`\n\n"
+                "`[p]do members role <@role>`\n"
+                "→ List members with a role and show count"
+            ),
             inline=False
         )
-
         embed.add_field(
-            name="📅 Event Commands",
-            value="`[p]do events list`\n"
-                  "→ List all Discord scheduled events\n\n"
-                  "`[p]do events members <event_name>`\n"
-                  "→ List members interested in an event\n"
-                  "Example: `[p]do events members Game Night`\n\n"
-                  "`[p]do events role <action> <event_name>`\n"
-                  "→ Manage roles for event attendees\n"
-                  "**Actions:**\n"
-                  "• `create` - Create a new role for the event\n"
-                  "• `sync` - Update role to match current members\n"
-                  "• `delete` - Remove the event's role\n"
-                  "Examples:\n"
-                  "`[p]do events role create Game Night`\n"
-                  "`[p]do events role sync Game Night`\n"
-                  "`[p]do events role delete Game Night`",
+            name="Event Commands",
+            value=(
+                "`[p]do event list`\n"
+                "→ List all Discord scheduled events\n\n"
+                "`[p]do event \"Event Name\"`\n"
+                "→ Show event summary + interested members\n\n"
+                "`[p]do event role <create|sync|delete> \"Event Name\"`\n"
+                "→ Manage roles for event attendees"
+            ),
             inline=False
         )
-
         embed.add_field(
-            name="🔧 Debug Commands (Owner Only)",
-            value="`[p]do logs [count]`\n"
-                  "→ View recent logs (default: 10)\n\n"
-                  "`[p]do debug`\n"
-                  "→ Show debug information\n\n"
-                  "`[p]do clearlogs`\n"
-                  "→ Clear all stored logs",
+            name="Debug (Owner Only)",
+            value=(
+                "`[p]do logs [count]`\n"
+                "→ View recent logs (default: 10)\n\n"
+                "`[p]do debug`\n"
+                "→ Show debug information\n\n"
+                "`[p]do clearlogs`\n"
+                "→ Clear all stored logs"
+            ),
             inline=False
         )
-
-        embed.add_field(
-            name="ℹ️ Notes",
-            value="• Events are Discord's built-in Scheduled Events\n"
-                  "• Create events through Discord's UI (not the bot)\n"
-                  "• The bot tracks who's interested in events\n"
-                  "• Event roles auto-update when synced\n"
-                  "• Use `[p]do logs` if you encounter errors",
-            inline=False
-        )
-
-        embed.set_footer(text="Replace [p] with your bot's prefix | Aliases: [p]do or [p]discoops")
+        embed.set_footer(text="Replace [p] with your bot's prefix | Group aliases: do event / do events")
         await ctx.send(embed=embed)
 
 
