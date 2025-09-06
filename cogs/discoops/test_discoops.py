@@ -1,10 +1,10 @@
 # File: cogs/discoops/test_discoops.py
 
-import unittest
-from unittest.mock import Mock, MagicMock, AsyncMock, patch, create_autospec
-from datetime import datetime, timedelta
+import unittest  # Import unittest FIRST so the cog knows we're testing
 import sys
 import os
+from unittest.mock import Mock, MagicMock, AsyncMock, patch, create_autospec
+from datetime import datetime, timedelta
 
 # Add the cog directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
