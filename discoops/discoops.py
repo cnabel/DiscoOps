@@ -442,6 +442,14 @@ class DiscoOps(commands.Cog):
             async with self.config.guild(ctx.guild).event_roles() as roles:
                 del roles[event_id_str]
     
+    @discoops.command(name="clearlogs")
+    @commands.is_owner()
+    async def discoops_clearlogs(self, ctx):
+        """Clear all stored logs."""
+        self.logs.clear()
+        await ctx.send("✅ Logs cleared.")
+        self.log_info(f"Logs cleared by {ctx.author}")
+    
     @discoops.command(name="help")
     async def discoops_help(self, ctx):
         """Show detailed help for DiscoOps commands."""
@@ -483,11 +491,23 @@ class DiscoOps(commands.Cog):
         )
         
         embed.add_field(
+            name="🔧 Debug Commands (Owner Only)",
+            value="`[p]do logs [count]`\n"
+                  "→ View recent logs (default: 10)\n\n"
+                  "`[p]do debug`\n"
+                  "→ Show debug information\n\n"
+                  "`[p]do clearlogs`\n"
+                  "→ Clear all stored logs",
+            inline=False
+        )
+        
+        embed.add_field(
             name="ℹ️ Notes",
             value="• Events are Discord's built-in Scheduled Events\n"
                   "• Create events through Discord's UI (not the bot)\n"
                   "• The bot tracks who's interested in events\n"
-                  "• Event roles auto-update when synced",
+                  "• Event roles auto-update when synced\n"
+                  "• Use `[p]do logs` if you encounter errors",
             inline=False
         )
         
