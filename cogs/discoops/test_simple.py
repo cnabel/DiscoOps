@@ -5,6 +5,7 @@ Simple test to verify the cog can be imported without errors.
 Run this to debug import issues.
 """
 
+import unittest  # Import unittest first to signal we're testing
 import sys
 import os
 from unittest.mock import MagicMock, Mock
