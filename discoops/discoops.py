@@ -2,13 +2,19 @@
 
 import discord
 from redbot.core import commands, Config
+from redbot.core.data_manager import cog_data_path
 from datetime import datetime, timedelta, timezone
 import asyncio
 from typing import Optional
-from collections import deque
 import unicodedata
+import os
+from pathlib import Path
 
 MAX_MSG = 1900  # stay safely below Discord's 2000 char limit
+MAX_LOG_BYTES = 1_000_000  # 1 MB cap for on-disk log
+MAX_LOG_DAYS = 14          # delete entries older than 14 days
+CLEANUP_EVERY_WRITES = 50  # run time-based cleanup every N writes
+
 
 class DiscoOps(commands.Cog):
     """Operational features to make Discord server management easier."""
@@ -19,13 +25,116 @@ class DiscoOps(commands.Cog):
         default_guild = {"event_roles": {}}  # Maps event_id to role_id
         self.config.register_guild(**default_guild)
 
-        # In-memory log buffer
-        self.logs = deque(maxlen=1000)
+        # Disk logging setup
+        self._log_lock = asyncio.Lock()
+        self._log_writes = 0
+        data_dir = cog_data_path(self)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self._log_path = data_dir / "discoops.log"
 
-    # --------- tiny internal logger ----------
-    def log_info(self, message: str):
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-        self.logs.append(f"[{ts}] {message}")
+    # --------- disk logger ----------
+    async def log_info(self, message: str):
+        """Append a log line to disk, with rotation + retention."""
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        line = f"[{ts}] {message}\n"
+        try:
+            async with self._log_lock:
+                # Append
+                with open(self._log_path, "a", encoding="utf-8", newline="") as f:
+                    f.write(line)
+                self._log_writes += 1
+
+                # Size-based cleanup first (fast path)
+                if self._log_path.exists() and self._log_path.stat().st_size > MAX_LOG_BYTES:
+                    self._truncate_to_max_bytes()
+
+                # Time-based cleanup periodically
+                if self._log_writes % CLEANUP_EVERY_WRITES == 0:
+                    self._time_prune_older_than(MAX_LOG_DAYS)
+                    # Re-enforce size cap after time prune
+                    if self._log_path.exists() and self._log_path.stat().st_size > MAX_LOG_BYTES:
+                        self._truncate_to_max_bytes()
+        except Exception:
+            # Silently ignore logging errors to not disrupt bot flow
+            pass
+
+    def _truncate_to_max_bytes(self):
+        """Trim the log file to keep only the last <= MAX_LOG_BYTES bytes aligned to lines."""
+        try:
+            p = self._log_path
+            if not p.exists():
+                return
+            size = p.stat().st_size
+            if size <= MAX_LOG_BYTES:
+                return
+            # Read tail
+            with open(p, "rb") as f:
+                # read last MAX_LOG_BYTES bytes (plus small margin) if file is larger
+                seek_to = max(0, size - (MAX_LOG_BYTES * 2))
+                f.seek(seek_to)
+                tail = f.read()
+            # Keep only the last MAX_LOG_BYTES from the tail, aligned to line boundary
+            tail_text = tail.decode("utf-8", errors="ignore")
+            # Take last MAX_LOG_BYTES worth of text
+            tail_text = tail_text[-MAX_LOG_BYTES:]
+            # Ensure we start at a new line
+            first_nl = tail_text.find("\n")
+            if first_nl != -1:
+                tail_text = tail_text[first_nl + 1 :]
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                f.write(tail_text)
+        except Exception:
+            pass
+
+    def _time_prune_older_than(self, days: int):
+        """Remove lines older than N days based on timestamp prefix."""
+        try:
+            p = self._log_path
+            if not p.exists():
+                return
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            kept_lines = []
+            with open(p, "r", encoding="utf-8") as f:
+                for ln in f:
+                    # Expected format: [YYYY-MM-DD HH:MM:SS UTC] message
+                    # Parse timestamp safely; if parse fails, keep the line.
+                    try:
+                        close = ln.find("]")
+                        if ln.startswith("[") and close != -1:
+                            ts_str = ln[1:close]  # e.g. 2025-09-06 22:18:15 UTC
+                            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S %Z")
+                            # treat naive as UTC just in case
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt >= cutoff:
+                                kept_lines.append(ln)
+                        else:
+                            kept_lines.append(ln)
+                    except Exception:
+                        kept_lines.append(ln)
+            # Write back
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                f.writelines(kept_lines)
+        except Exception:
+            pass
+
+    async def _logs_tail(self, count: int) -> str:
+        """Return the last `count` lines from disk, efficiently."""
+        try:
+            p = self._log_path
+            if not p.exists():
+                return ""
+            # Read up to ~1.2MB to be safe; file is capped at 1MB anyway.
+            with open(p, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                to_read = min(size, 1_200_000)
+                f.seek(max(0, size - to_read))
+                blob = f.read().decode("utf-8", errors="ignore")
+            lines = [ln for ln in blob.splitlines() if ln.strip()]
+            return "\n".join(lines[-count:]) if lines else ""
+        except Exception:
+            return ""
 
     # --------- helpers ----------
     @staticmethod
@@ -125,12 +234,12 @@ class DiscoOps(commands.Cog):
         Usage: [p]do members new <amount> <period>
         Example: [p]do members new 7 days
         """
-        self.log_info(f"{ctx.author} invoked 'members new' with amount={amount}, period={period} in guild {ctx.guild.id}")
+        await self.log_info(f"{ctx.author} invoked 'members new' with amount={amount}, period={period} in guild {ctx.guild.id}")
 
         period_l = (period or "").lower()
         if period_l not in ("days", "day", "weeks", "week", "months", "month"):
             await ctx.send("Period must be 'days', 'weeks', or 'months'")
-            self.log_info("Invalid period provided to 'members new'")
+            await self.log_info("Invalid period provided to 'members new'")
             return
 
         if period_l in ("days", "day"):
@@ -153,13 +262,13 @@ class DiscoOps(commands.Cog):
                     pass
         except Exception as e:
             members = []
-            self.log_info(f"Error accessing guild members: {e}")
+            await self.log_info(f"Error accessing guild members: {e}")
 
         if not members:
             await ctx.send(
                 "I couldn't access the member list. Ensure **Server Members Intent** is enabled and the bot has cached members."
             )
-            self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
+            await self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
             return
 
         # Filter recent members, handle tz-awareness defensively
@@ -174,7 +283,7 @@ class DiscoOps(commands.Cog):
                 if ja > cutoff_date:
                     recent.append((m, ja))
         except Exception as e:
-            self.log_info(f"Error filtering recent members: {e}")
+            await self.log_info(f"Error filtering recent members: {e}")
             await ctx.send("An error occurred while reading member join dates.")
             return
 
@@ -182,7 +291,7 @@ class DiscoOps(commands.Cog):
 
         if not recent:
             await ctx.send(f"No members joined in the last {amount} {period_l}.")
-            self.log_info("No recent members found")
+            await self.log_info("No recent members found")
             return
 
         # Build plain markdown sections and paginate
@@ -199,12 +308,12 @@ class DiscoOps(commands.Cog):
             sections.append(block)
 
         await self._send_paginated(ctx, sections, header=header)
-        self.log_info(f"Sent recent members list ({len(recent)} found)")
+        await self.log_info(f"Sent recent members list ({len(recent)} found)")
 
     @members_group.command(name="role")
     async def members_role(self, ctx, *, role: discord.Role):
         """List all members with a specific role and show count."""
-        self.log_info(f"{ctx.author} invoked 'members role' for role {role.id} in guild {ctx.guild.id}")
+        await self.log_info(f"{ctx.author} invoked 'members role' for role {role.id} in guild {ctx.guild.id}")
         members_with_role = role.members
 
         header = f"# Members with role\n**Role:** `{role.name}`  •  **Total:** {len(members_with_role)}"
@@ -230,7 +339,7 @@ class DiscoOps(commands.Cog):
         sections.append(role_info)
 
         await self._send_paginated(ctx, sections, header=header)
-        self.log_info(f"Sent members-with-role list ({len(members_with_role)} members)")
+        await self.log_info(f"Sent members-with-role list ({len(members_with_role)} members)")
 
     # ========== Event Commands (Using Discord's Scheduled Events) ==========
 
@@ -304,7 +413,7 @@ class DiscoOps(commands.Cog):
             sections.append(section)
 
         await self._send_paginated(ctx, sections, header=header)
-        self.log_info(f"{ctx.author} listed events (plain messages) in guild {ctx.guild.id}")
+        await self.log_info(f"{ctx.author} listed events (plain messages) in guild {ctx.guild.id}")
 
     @event_group.command(name="members")  # deprecated path, kept for compatibility
     async def event_members_legacy(self, ctx, *, event_name: str):
@@ -318,7 +427,7 @@ class DiscoOps(commands.Cog):
         event = self._event_match(events, event_name)
         if not event:
             await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
-            self.log_info(f"event info: not found for query={event_name!r}")
+            await self.log_info(f"event info: not found for query={event_name!r}")
             return
 
         # Collect users
@@ -330,7 +439,7 @@ class DiscoOps(commands.Cog):
                     interested_users.append(member)
         except Exception as e:
             await ctx.send(f"Error fetching interested users: {e}")
-            self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
+            await self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
         status = getattr(event.status, "name", "UNKNOWN").title() if getattr(event, "status", None) else "UNKNOWN"
@@ -388,7 +497,7 @@ class DiscoOps(commands.Cog):
             sections.append("## Interested Members 0\n> None")
 
         await self._send_paginated(ctx, sections, header=header)
-        self.log_info(f"{ctx.author} viewed event info for {getattr(event, 'id', 'unknown')} in guild {ctx.guild.id}")
+        await self.log_info(f"{ctx.author} viewed event info for {getattr(event, 'id', 'unknown')} in guild {ctx.guild.id}")
 
     @event_group.command(name="role")
     async def event_role(self, ctx, action: str, *, event_name: str):
@@ -405,7 +514,7 @@ class DiscoOps(commands.Cog):
         event = self._event_match(events, event_name)
         if not event:
             await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
-            self.log_info(f"event role: not found for query={event_name!r}")
+            await self.log_info(f"event role: not found for query={event_name!r}")
             return
 
         # Interested users
@@ -417,7 +526,7 @@ class DiscoOps(commands.Cog):
                     interested_users.append(member)
         except Exception as e:
             await ctx.send(f"Error fetching interested users: {e}")
-            self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
+            await self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
         event_roles = await self.config.guild(ctx.guild).event_roles()
@@ -446,7 +555,7 @@ class DiscoOps(commands.Cog):
                     except discord.Forbidden:
                         pass
                 await ctx.send(f"Created role {role.mention} and added to {added} interested members")
-                self.log_info(f"Created role {role.id} for event {event_id_str} in guild {ctx.guild.id}")
+                await self.log_info(f"Created role {role.id} for event {event_id_str} in guild {ctx.guild.id}")
             except discord.Forbidden:
                 await ctx.send("I don't have permission to create roles.")
                 return
@@ -488,7 +597,7 @@ class DiscoOps(commands.Cog):
                         pass
 
             await ctx.send(f"Sync complete for {role.mention} — Added: {added} • Removed: {removed}")
-            self.log_info(f"Synced role {role.id} for event {event_id_str} in guild {ctx.guild.id}: +{added}/-{removed}")
+            await self.log_info(f"Synced role {role.id} for event {event_id_str} in guild {ctx.guild.id}: +{added}/-{removed}")
 
         elif action_l == "delete":
             if event_id_str not in event_roles:
@@ -505,29 +614,27 @@ class DiscoOps(commands.Cog):
             async with self.config.guild(ctx.guild).event_roles() as roles:
                 if event_id_str in roles:
                     del roles[event_id_str]
-            self.log_info(f"Deleted role for event {event_id_str} in guild {ctx.guild.id}")
+            await self.log_info(f"Deleted role for event {event_id_str} in guild {ctx.guild.id}")
 
     # ========== Debug / Logs (Owner Only) ==========
 
     @discoops.command(name="logs")
     @commands.is_owner()
     async def discoops_logs(self, ctx, count: Optional[int] = 10):
-        """View recent in-memory logs. Default: 10"""
+        """View recent on-disk logs. Default: 10 lines."""
         try:
             count = int(count or 10)
         except Exception:
             count = 10
-        count = max(1, min(count, 50))
+        count = max(1, min(count, 200))  # allow up to 200 lines for convenience
 
-        if not self.logs:
+        content = await self._logs_tail(count)
+        if not content:
             await ctx.send("No logs recorded yet.")
             return
 
-        lines = list(self.logs)[-count:]
-        content = "\n".join(lines)
-        # logs can be long; paginate too
+        # Paginate long logs too
         header = "# DiscoOps Logs"
-        # split the content into sections around newlines
         raw_lines = content.split("\n")
         chunks, cur = [], ""
         for ln in raw_lines:
@@ -564,10 +671,14 @@ class DiscoOps(commands.Cog):
     @discoops.command(name="clearlogs")
     @commands.is_owner()
     async def discoops_clearlogs(self, ctx):
-        """Clear all stored logs."""
-        self.logs.clear()
-        await ctx.send("Logs cleared.")
-        self.log_info(f"Logs cleared by {ctx.author}")
+        """Clear all stored logs (on disk)."""
+        try:
+            if self._log_path.exists():
+                self._log_path.unlink()
+            await ctx.send("Logs cleared.")
+            await self.log_info(f"Logs cleared by {ctx.author}")  # creates a fresh file with one entry
+        except Exception as e:
+            await ctx.send(f"Couldn't clear logs: {e}")
 
     @discoops.command(name="help")
     async def discoops_help(self, ctx):
