@@ -5,11 +5,7 @@ DiscoOps - Discord Red Bot Cog
 Operational features to make Discord server management easier.
 """
 
-try:
-    from .discoops import DiscoOps
-except ImportError as e:
-    print(f"Failed to import DiscoOps: {e}")
-    DiscoOps = None
+from .discoops import DiscoOps
 
 __red_end_user_data_statement__ = (
     "This cog stores Discord event role mappings per guild. "
@@ -17,10 +13,16 @@ __red_end_user_data_statement__ = (
     "To delete the data, unload the cog and reset the config."
 )
 
-
-async def setup(bot):
-    """Load the DiscoOps cog."""
-    if DiscoOps is None:
-        raise ImportError("DiscoOps cog could not be imported")
-    cog = DiscoOps(bot)
-    await bot.add_cog(cog)
+# Try async setup first (Red 3.5+), fall back to sync if needed
+try:
+    from redbot.core.bot import Red
+    
+    async def setup(bot: Red):
+        """Load the DiscoOps cog (Red 3.5+)."""
+        await bot.add_cog(DiscoOps(bot))
+        
+except ImportError:
+    # Fallback for older Red versions
+    def setup(bot):
+        """Load the DiscoOps cog (Red 3.4 and earlier)."""
+        bot.add_cog(DiscoOps(bot))
