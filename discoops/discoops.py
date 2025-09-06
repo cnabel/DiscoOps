@@ -55,37 +55,66 @@ class DiscoOps(commands.Cog):
         Usage: [p]do members new <amount> <period>
         Example: [p]do members new 7 days
         """
-        period = period.lower()
-        if period not in ['days', 'day', 'weeks', 'week', 'months', 'month']:
+        self.log_info(f"{ctx.author} invoked 'members new' with amount={amount}, period={period} in guild {ctx.guild.id}")
+
+        period_l = period.lower()
+        if period_l not in ['days', 'day', 'weeks', 'week', 'months', 'month']:
             await ctx.send("Period must be 'days', 'weeks', or 'months'")
+            self.log_info("Invalid period provided to 'members new'")
             return
 
         # Calculate time delta
-        if period in ['days', 'day']:
+        if period_l in ['days', 'day']:
             delta = timedelta(days=amount)
-        elif period in ['weeks', 'week']:
+        elif period_l in ['weeks', 'week']:
             delta = timedelta(weeks=amount)
-        else:  # months
-            delta = timedelta(days=amount * 30)  # Approximate
+        else:  # months (approximate)
+            delta = timedelta(days=amount * 30)
 
         cutoff_date = datetime.utcnow() - delta
 
+        # Try to access members; this needs the Server Members Intent
+        try:
+            members = list(ctx.guild.members)
+            if not members:
+                # If cache is empty, try chunk (still requires intents.members)
+                try:
+                    await ctx.guild.chunk()
+                    members = list(ctx.guild.members)
+                except Exception as e:
+                    # continue; we’ll warn below
+                    pass
+        except Exception as e:
+            members = []
+            self.log_info(f"Error accessing guild members: {e}")
+
+        if not members:
+            await ctx.send(
+                "I couldn't access the member list. Make sure **Server Members Intent** is enabled for the bot "
+                "and the bot has recently been online to cache members."
+            )
+            self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
+            return
+
         # Get members who joined after cutoff date
-        recent_members = []
-        for member in ctx.guild.members:
-            if member.joined_at and member.joined_at > cutoff_date:
-                recent_members.append(member)
+        try:
+            recent_members = [m for m in members if getattr(m, "joined_at", None) and m.joined_at > cutoff_date]
+        except Exception as e:
+            self.log_info(f"Error filtering recent members: {e}")
+            await ctx.send("An error occurred while reading member join dates.")
+            return
 
         # Sort by join date (most recent first)
         recent_members.sort(key=lambda m: m.joined_at, reverse=True)
 
         if not recent_members:
-            await ctx.send(f"No members joined in the last {amount} {period}.")
+            await ctx.send(f"No members joined in the last {amount} {period_l}.")
+            self.log_info("No recent members found")
             return
 
         # Create embed with results
         embed = discord.Embed(
-            title=f"New Members - Last {amount} {period}",
+            title=f"New Members - Last {amount} {period_l}",
             color=discord.Color.blue(),
             description=f"Found {len(recent_members)} member(s)"
         )
@@ -104,6 +133,7 @@ class DiscoOps(commands.Cog):
             embed.set_footer(text=f"Showing first 25 of {len(recent_members)} members")
 
         await ctx.send(embed=embed)
+        self.log_info(f"Sent recent members list ({len(recent_members)} found)")
 
     @members_group.command(name="role")
     async def members_role(self, ctx, *, role: discord.Role):
@@ -113,6 +143,7 @@ class DiscoOps(commands.Cog):
         Usage: [p]do members role <@role>
         Example: [p]do members role @Moderator
         """
+        self.log_info(f"{ctx.author} invoked 'members role' for role {role.id} in guild {ctx.guild.id}")
         members_with_role = role.members
 
         embed = discord.Embed(
@@ -157,6 +188,7 @@ class DiscoOps(commands.Cog):
         )
 
         await ctx.send(embed=embed)
+        self.log_info(f"Sent members-with-role list ({len(members_with_role)} members)")
 
     # ========== Events Commands (Using Discord's Scheduled Events) ==========
 
@@ -206,9 +238,7 @@ class DiscoOps(commands.Cog):
 
             # Time formatting (Discord timestamp + raw epoch)
             if event.start_time:
-                # ensure tz-aware epoch
                 epoch = int(event.start_time.replace(tzinfo=event.start_time.tzinfo or timezone.utc).timestamp())
-                # <t:epoch:F> renders nicely in the viewer's local timezone; also show relative time
                 discord_time = f"<t:{epoch}:F> • <t:{epoch}:R>"
                 unix_time = f"`{epoch}`"
                 start_line = f"{discord_time} (unix: {unix_time})"
@@ -216,9 +246,12 @@ class DiscoOps(commands.Cog):
                 start_line = "N/A"
 
             # Build field value
-            field_value = f"**Status:** {status_emoji} {status}\n"
+            # Include copy-friendly name and a ready-to-copy quick command using that name
+            field_value = f"**Name:** `{event.name}`\n"
+            field_value += f"**Status:** {status_emoji} {status}\n"
             field_value += f"**Start:** {start_line}\n"
             field_value += f"**Interested:** {user_count} users\n"
+            field_value += f"**Quick command:** `[p]do events members \"{event.name}\"`\n"
 
             if event.description:
                 # Truncate description if too long
@@ -296,7 +329,7 @@ class DiscoOps(commands.Cog):
                 inline=False
             )
 
-        # Add event details
+        # Add event details (copy-friendly name + times)
         if event.start_time:
             epoch = int(event.start_time.timestamp())
             start_line = f"<t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
@@ -305,7 +338,12 @@ class DiscoOps(commands.Cog):
 
         embed.add_field(
             name="Event Details",
-            value=f"**Start:** {start_line}\n**Status:** {event.status.name}",
+            value=(
+                f"**Name:** `{event.name}`\n"
+                f"**Start:** {start_line}\n"
+                f"**Status:** {event.status.name}\n"
+                f"**Quick command:** `[p]do events members \"{event.name}\"`"
+            ),
             inline=False
         )
 
