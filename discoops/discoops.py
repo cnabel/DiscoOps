@@ -1,4 +1,4 @@
-# File: cogs/discoops/discoops.py
+# File: discoops/discoops.py
 
 import discord
 from redbot.core import commands, Config
