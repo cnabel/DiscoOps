@@ -1,213 +1,157 @@
-# File: README.md
-
 # DiscoOps - Discord Red Bot Cog
 
-A comprehensive operational toolkit for Discord server management, designed to make running a Discord server easier and more efficient.
+A clean, README-style operational toolkit for Discord server management.  
+Outputs are plain Markdown messages (not embeds) with automatic pagination under Discord’s 2,000-character limit.
 
 ## Features
 
-### 📊 Member Management
-- Track new members who joined recently
-- Analyze role membership and statistics
-- View member counts and role distributions
+### Member Management
+- List members who joined recently (days/weeks/months)
+- Inspect role membership with readable, paginated lists
+- Lightweight, copy-friendly formatting
 
-### 📅 Event Management
-- Integrate with Discord's built-in Scheduled Events
-- Track event attendees and interested members
-- Create and manage event-specific roles
-- Automatically sync roles with event attendance
+### Event Management (Discord Scheduled Events)
+- List all scheduled events (sorted by start time)
+- Show a single event summary **plus** interested members
+- Create / sync / delete per-event roles (optional workflow)
+- Robust name matching (handles quotes/diacritics/partials)
 
 ## Installation
 
 1. **Add the repository to your Red Bot:**
-```
 [p]repo add DiscoOps https://github.com/yourusername/DiscoOps
-```
 
 2. **Install the cog:**
-```
 [p]cog install DiscoOps discoops
-```
 
 3. **Load the cog:**
-```
 [p]load discoops
-```
 
 ## Commands
 
-Replace `[p]` with your bot's prefix. You can use either `[p]do` or `[p]discoops` as the base command.
+Replace [p] with your bot’s prefix.  
+Use either [p]do or [p]discoops as the base command.  
+For events, **event is primary**; events remains as an alias.
 
 ### Member Commands
 
 #### View Recent Members
-See who joined your server recently:
-```
+List members who joined within a time window:
 [p]do members new 7 days
-[p]do members new 2 weeks  
+[p]do members new 2 weeks
 [p]do members new 1 month
-```
+
+- Output shows each member with ID and join time as Discord timestamp (<t:...>) and unix epoch.
 
 #### Analyze Roles
-Check who has a specific role:
-```
+Show members with a specific role:
 [p]do members role @Moderator
 [p]do members role @Verified
 [p]do members role "Game Night"
-```
 
 ### Event Commands
 
 #### List All Events
-View all scheduled events sorted by date (soonest first):
-```
-[p]do events list
-```
+Plain-message list, sorted by start time (soonest first):
+[p]do event list
 
-#### Check Event Attendance
-See who's interested in an event:
-```
-[p]do events members "Game Night"
-[p]do events members "Movie Watch Party"
-```
+- Event titles are headers one level below the main “Scheduled Events” header.
+- Start time appears as Discord timestamp and unix epoch.
+- Multi-line descriptions stay inside a blockquote for consistent formatting.
+- Auto-paginated if needed.
+
+#### Show One Event (Summary + Interested Members)
+Combined summary and attendance in one command:
+[p]do event "Game Night"
+[p]do event Rådsmötet
+
+- Displays: status, start time, interested count, (multi-line) description, location/channel.
+- Interested Members N header shows the total; additional pages are labeled “(continued)”.
 
 #### Manage Event Roles
+(Optional workflow—no hints are auto-printed in outputs.)
+[p]do event role create "Game Night"
+[p]do event role sync "Game Night"
+[p]do event role delete "Game Night"
 
-**Create a role for an event:**
-```
-[p]do events role create "Game Night"
-```
-This creates a role and assigns it to everyone interested in the event.
+### Debug / Logs (Owner Only)
+[p]do logs [count]   # default 10; paginated if long
+[p]do debug          # basic environment and permission info (plain text)
+[p]do clearlogs      # clear in-memory logs
 
-**Sync the role with current attendees:**
-```
-[p]do events role sync "Game Night"
-```
-This updates the role - adds it to newly interested members and removes it from those no longer interested.
-
-**Delete an event role:**
-```
-[p]do events role delete "Game Night"
-```
-
-### Get Help
-View all available commands:
-```
+### Help
 [p]do help
-```
 
 ## Practical Usage Examples
 
 ### Weekly New Member Report
-Run this every Monday to see who joined in the past week:
-```
 [p]do members new 7 days
-```
 
 ### Event Management Workflow
-
-1. **Create an event in Discord** (using Discord's event feature)
-
-2. **List events to get the exact name:**
-```
-[p]do events list
-```
-
-3. **Create a role for the event:**
-```
-[p]do events role create "Friday Game Night"
-```
-
-4. **Before the event, sync the role to catch latecomers:**
-```
-[p]do events role sync "Friday Game Night"
-```
-
-5. **Use the role to ping attendees:**
-```
-@Event: Friday Game Night The event is starting in 10 minutes!
-```
-
-6. **After the event, clean up:**
-```
-[p]do events role delete "Friday Game Night"
-```
+1) Create a Scheduled Event in Discord.  
+2) Get exact names:
+[p]do event list
+3) Create a role for an event (optional):
+[p]do event role create "Friday Game Night"
+4) Before the event, sync attendees:
+[p]do event role sync "Friday Game Night"
+5) After the event, clean up:
+[p]do event role delete "Friday Game Night"
 
 ### Role Audit
-Check how many people have specific roles:
-```
 [p]do members role @Moderator
 [p]do members role @VIP
 [p]do members role @Subscriber
-```
 
-### Bulk Event Management
-If you have multiple events, you can quickly manage them:
-```
-# List all events
-[p]do events list
+## Behavior & Formatting
 
-# Check attendance for each
-[p]do events members "Event 1"
-[p]do events members "Event 2"
-
-# Create roles for popular events
-[p]do events role create "Popular Event"
-```
+- Plain messages, not embeds. Everything is sent as normal messages with headers (#, ##) and blockquotes (>).
+- Pagination: All long outputs auto-split below 2,000 characters.
+- Timestamps: Times are shown as Discord timestamps (rendered in the viewer’s local timezone) and a unix epoch for copy/paste.
+- Event Names: Robust matching (case-insensitive, handles partials, quotes, diacritics). For absolute accuracy, copy the name from [p]do event list.
 
 ## Permissions Required
 
-The bot needs the following Discord permissions:
-- **View Server Members** - To list and analyze members
-- **Manage Roles** - To create and assign event roles
-- **Send Messages** - To respond to commands
-- **Embed Links** - To send formatted responses
-- **View Channels** - To read commands
+Bot:
+- View Channels
+- Send Messages
+- Manage Roles (only if you use event role commands)
+- Server Members Intent (in the bot developer portal) to access join dates/member lists
 
-Users need the **Manage Server** permission to use DiscoOps commands.
+User (to run DiscoOps commands):
+- Manage Server (a.k.a. Manage Guild)
+
+> Note: Since outputs are plain messages, Embed Links permission is not required.
 
 ## Tips & Best Practices
 
-1. **Event Names**: When using event commands, you can use partial names. The bot will try to match your input to existing events.
-
-2. **Role Colors**: Event roles are created with random colors. You can manually edit them in Discord's role settings if needed.
-
-3. **Large Servers**: For servers with many members, the bot limits displays to the first 25-50 entries to avoid hitting Discord's limits.
-
-4. **Timezone**: All times are displayed in UTC for consistency.
-
-5. **Regular Maintenance**: 
-   - Sync event roles before events start
-   - Clean up old event roles after events end
-   - Run weekly member reports to track growth
+1. Exact Names: Use [p]do event list and copy the exact header text for names that include special characters.
+2. Large Servers: Outputs paginate cleanly; you can rerun with narrower windows (e.g., 3 days) or filter by role.
+3. Time Display: Discord timestamps (<t:...>) auto-render in each user’s local timezone; unix epoch is included for tooling/scripting.
+4. Role Workflow: Roles are optional—use only if you need to @mention attendees.
 
 ## Troubleshooting
 
-### "No members joined in the last X days"
-- Make sure the bot has permission to view server members
-- Check if members might have joined just outside your time range
+### “No members joined in the last X …”
+- Ensure the bot has Server Members Intent enabled and has had time to cache members.
 
-### "Event not found"
-- Use `[p]do events list` to see the exact event names
-- Event names are case-insensitive but must exist in Discord
+### “Event not found”
+Run:
+[p]do event list
+Copy the event name exactly (quotes/diacritics are supported). Partial names also work in most cases.
 
-### Role creation fails
-- Ensure the bot has "Manage Roles" permission
-- Check that the bot's role is high enough in the hierarchy
+### Role creation/sync/delete problems
+- Confirm the bot has Manage Roles and its role is above the roles it needs to assign/remove.
 
 ### Commands not working
-- Verify the cog is loaded: `[p]cog list`
-- Check bot permissions in the channel
-- Ensure you have "Manage Server" permission
+- Verify the cog is loaded: [p]cog list
+- Check the channel’s bot permissions (Send Messages, View Channels)
+- Ensure you have Manage Server
 
 ## Support
 
-For issues, feature requests, or contributions, please visit the [GitHub repository](https://github.com/yourusername/DiscoOps).
+Issues and feature requests: GitHub repository
 
 ## License
 
-This cog is provided as-is for use with Red-DiscordBot.
-
----
-
-*DiscoOps - Making Discord server operations simple and efficient.*
+Provided as-is for use with Red-DiscordBot.
