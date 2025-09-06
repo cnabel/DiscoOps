@@ -4,10 +4,9 @@ import discord
 from redbot.core import commands, Config
 from datetime import datetime, timedelta, timezone
 import asyncio
-from typing import Optional, List, Tuple, Deque
+from typing import Optional
 from collections import deque
 import unicodedata
-
 
 class DiscoOps(commands.Cog):
     """Operational features to make Discord server management easier."""
@@ -15,14 +14,11 @@ class DiscoOps(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=260288776360820736)
-
-        default_guild = {
-            "event_roles": {}  # Maps event_id to role_id
-        }
+        default_guild = {"event_roles": {}}  # Maps event_id to role_id
         self.config.register_guild(**default_guild)
 
-        # 3.8-friendly typing
-        self.logs: Deque[str] = deque(maxlen=1000)
+        # In-memory log buffer
+        self.logs = deque(maxlen=1000)
 
     # --------- tiny internal logger ----------
     def log_info(self, message: str):
@@ -40,14 +36,30 @@ class DiscoOps(commands.Cog):
         return s.casefold()
 
     @staticmethod
-    def _event_match(events, query: str):
+    async def _get_scheduled_events(guild, with_counts: bool = True):
+        """Safely fetch scheduled events across discord.py versions."""
+        try:
+            # discord.py 2.x
+            return await guild.fetch_scheduled_events(with_counts=with_counts)
+        except TypeError:
+            # Some builds don’t support with_counts kwarg
+            try:
+                return await guild.fetch_scheduled_events()
+            except Exception:
+                return []
+        except AttributeError:
+            # Very old discord.py without scheduled events
+            return []
+
+    @classmethod
+    def _event_match(cls, events, query: str):
         """Find event by normalized exact name, then partial match."""
-        nq = DiscoOps._norm_text(query)
+        nq = cls._norm_text(query)
         for e in events:
-            if DiscoOps._norm_text(e.name) == nq:
+            if cls._norm_text(getattr(e, "name", "")) == nq:
                 return e
         for e in events:
-            if nq in DiscoOps._norm_text(e.name):
+            if nq in cls._norm_text(getattr(e, "name", "")):
                 return e
         return None
 
@@ -80,14 +92,14 @@ class DiscoOps(commands.Cog):
         self.log_info(f"{ctx.author} invoked 'members new' with amount={amount}, period={period} in guild {ctx.guild.id}")
 
         period_l = (period or "").lower()
-        if period_l not in ['days', 'day', 'weeks', 'week', 'months', 'month']:
+        if period_l not in ("days", "day", "weeks", "week", "months", "month"):
             await ctx.send("Period must be 'days', 'weeks', or 'months'")
             self.log_info("Invalid period provided to 'members new'")
             return
 
-        if period_l in ['days', 'day']:
+        if period_l in ("days", "day"):
             delta = timedelta(days=amount)
-        elif period_l in ['weeks', 'week']:
+        elif period_l in ("weeks", "week"):
             delta = timedelta(weeks=amount)
         else:
             delta = timedelta(days=amount * 30)
@@ -114,8 +126,9 @@ class DiscoOps(commands.Cog):
             self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
             return
 
+        # Filter recent members, handle tz-awareness defensively
         try:
-            recent: List[Tuple[discord.Member, datetime]] = []
+            recent = []
             for m in members:
                 ja = getattr(m, "joined_at", None)
                 if not ja:
@@ -138,11 +151,7 @@ class DiscoOps(commands.Cog):
 
         # README-like embed (headers + blockquote)
         title = f"# New Members\n**Range:** last **{amount} {period_l}**  •  **Found:** {len(recent)}"
-        embed = discord.Embed(
-            title="",
-            description=title,
-            color=discord.Color.blue(),
-        )
+        embed = discord.Embed(title="", description=title, color=discord.Color.blue())
 
         for i, (member, ja) in enumerate(recent[:25], start=1):
             epoch = int(ja.timestamp())
@@ -219,43 +228,54 @@ class DiscoOps(commands.Cog):
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
         """List scheduled events (README style)."""
-        events = await ctx.guild.fetch_scheduled_events(with_counts=True)
+        events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         if not events:
             await ctx.send("No scheduled events found in this server.")
             return
 
         far_future = datetime.max.replace(tzinfo=timezone.utc)
-        events.sort(key=lambda e: e.start_time or far_future)
+        try:
+            events.sort(key=lambda e: e.start_time or far_future)
+        except Exception:
+            pass
 
         header = f"# Scheduled Events\n**Total:** {len(events)}"
         embed = discord.Embed(description=header, color=discord.Color.green())
 
         for event in events:
-            status = event.status.name.title()
-            user_count = event.user_count or 0
+            status = getattr(event.status, "name", "UNKNOWN").title() if getattr(event, "status", None) else "UNKNOWN"
+            user_count = getattr(event, "user_count", 0) or 0
 
-            if event.start_time:
-                epoch = int(event.start_time.replace(tzinfo=event.start_time.tzinfo or timezone.utc).timestamp())
+            st = getattr(event, "start_time", None)
+            if st:
+                if st.tzinfo is None:
+                    st = st.replace(tzinfo=timezone.utc)
+                epoch = int(st.timestamp())
                 start_line = f"<t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
             else:
                 start_line = "N/A"
 
-            summary_lines = [
+            lines = [
                 f"> **Status**: {status}",
                 f"> **Start**: {start_line}",
                 f"> **Interested**: {user_count}",
             ]
-            if event.description:
-                desc = event.description[:200] + "..." if len(event.description) > 200 else event.description
-                summary_lines.append(f"> **Description**: {desc}")
-            if event.location:
-                summary_lines.append(f"> **Location**: {event.location}")
-            elif event.channel:
-                summary_lines.append(f"> **Channel**: {event.channel.mention}")
+            desc = getattr(event, "description", None)
+            if desc:
+                desc_short = desc[:200] + "..." if len(desc) > 200 else desc
+                lines.append(f"> **Description**: {desc_short}")
+            if getattr(event, "location", None):
+                lines.append(f"> **Location**: {event.location}")
+            elif getattr(event, "channel", None):
+                try:
+                    lines.append(f"> **Channel**: {event.channel.mention}")
+                except Exception:
+                    pass
 
+            name = getattr(event, "name", "Unnamed Event")
             embed.add_field(
-                name=f"## `{event.name}`",
-                value="\n".join(summary_lines) + f"\n\n**Quick:** `[p]do event \"{event.name}\"`",
+                name=f"## `{name}`",
+                value="\n".join(lines) + f"\n\n**Quick:** `[p]do event \"{name}\"`",
                 inline=False
             )
 
@@ -270,7 +290,7 @@ class DiscoOps(commands.Cog):
 
     async def _event_info_with_members(self, ctx, event_name: str):
         """Show one event summary (README style) + interested members."""
-        events = await ctx.guild.fetch_scheduled_events(with_counts=True)
+        events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         event = self._event_match(events, event_name)
         if not event:
             await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
@@ -278,42 +298,54 @@ class DiscoOps(commands.Cog):
             return
 
         # Collect users
+        interested_users = []
         try:
-            interested_users = []
             async for user in event.users():
                 member = ctx.guild.get_member(user.id)
                 if member:
                     interested_users.append(member)
         except Exception as e:
             await ctx.send(f"Error fetching interested users: {e}")
-            self.log_info(f"Error fetching users for event {event.id}: {e}")
+            self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
-        status = event.status.name.title()
-        if event.start_time:
-            epoch = int(event.start_time.replace(tzinfo=event.start_time.tzinfo or timezone.utc).timestamp())
+        status = getattr(event.status, "name", "UNKNOWN").title() if getattr(event, "status", None) else "UNKNOWN"
+
+        st = getattr(event, "start_time", None)
+        if st:
+            if st.tzinfo is None:
+                st = st.replace(tzinfo=timezone.utc)
+            epoch = int(st.timestamp())
             start_line = f"<t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
         else:
             start_line = "N/A"
 
-        user_count = event.user_count or 0
+        user_count = getattr(event, "user_count", 0) or 0
+        name = getattr(event, "name", "Unnamed Event")
+        desc = getattr(event, "description", None)
 
-        title_header = f"# `{event.name}`"
-        summary_block = (
-            f"> **Status**: {status}\n"
-            f"> **Start**: {start_line}\n"
-            f"> **Interested**: {user_count}\n"
-            f"{(f'> **Description**: {event.description[:1024]}\n') if event.description else ''}"
-            f"{(f'> **Location**: {event.location}\n') if event.location else (f'> **Channel**: {event.channel.mention}\n' if event.channel else '')}"
-            f"> **Role**: `[p]do event role create \"{event.name}\"` • "
-            f"`[p]do event role sync \"{event.name}\"` • "
-            f"`[p]do event role delete \"{event.name}\"`"
+        title_header = f"# `{name}`"
+        summary_lines = [
+            f"> **Status**: {status}",
+            f"> **Start**: {start_line}",
+            f"> **Interested**: {user_count}",
+        ]
+        if desc:
+            summary_lines.append(f"> **Description**: {desc[:1024]}")
+        if getattr(event, "location", None):
+            summary_lines.append(f"> **Location**: {event.location}")
+        elif getattr(event, "channel", None):
+            try:
+                summary_lines.append(f"> **Channel**: {event.channel.mention}")
+            except Exception:
+                pass
+        summary_lines.append(
+            f"> **Role**: `[p]do event role create \"{name}\"` • "
+            f"`[p]do event role sync \"{name}\"` • "
+            f"`[p]do event role delete \"{name}\"`"
         )
 
-        embed = discord.Embed(
-            description=f"{title_header}\n\n{summary_block}",
-            color=discord.Color.blue()
-        )
+        embed = discord.Embed(description=f"{title_header}\n\n" + "\n".join(summary_lines), color=discord.Color.blue())
 
         # Interested members
         if interested_users:
@@ -329,14 +361,10 @@ class DiscoOps(commands.Cog):
             if len(interested_users) > 50:
                 embed.set_footer(text=f"Showing first 50 of {len(interested_users)} interested members")
         else:
-            embed.add_field(
-                name="## Interested Members",
-                value="> None",
-                inline=False
-            )
+            embed.add_field(name="## Interested Members", value="> None", inline=False)
 
         await ctx.send(embed=embed)
-        self.log_info(f"{ctx.author} viewed event info for {event.id} in guild {ctx.guild.id}")
+        self.log_info(f"{ctx.author} viewed event info for {getattr(event, 'id', 'unknown')} in guild {ctx.guild.id}")
 
     @event_group.command(name="role")
     async def event_role(self, ctx, action: str, *, event_name: str):
@@ -344,12 +372,12 @@ class DiscoOps(commands.Cog):
         Create, sync, or delete a role for event attendees.
         Usage: [p]do event role <create|sync|delete> <event_name>
         """
-        action = (action or "").lower()
-        if action not in ['create', 'sync', 'delete']:
+        action_l = (action or "").lower()
+        if action_l not in ("create", "sync", "delete"):
             await ctx.send("Action must be 'create', 'sync', or 'delete'")
             return
 
-        events = await ctx.guild.fetch_scheduled_events(with_counts=True)
+        events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         event = self._event_match(events, event_name)
         if not event:
             await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
@@ -365,13 +393,13 @@ class DiscoOps(commands.Cog):
                     interested_users.append(member)
         except Exception as e:
             await ctx.send(f"Error fetching interested users: {e}")
-            self.log_info(f"Error fetching users for event {event.id}: {e}")
+            self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
         event_roles = await self.config.guild(ctx.guild).event_roles()
-        event_id_str = str(event.id)
+        event_id_str = str(getattr(event, "id", "0"))
 
-        if action == "create":
+        if action_l == "create":
             if event_id_str in event_roles:
                 role = ctx.guild.get_role(event_roles[event_id_str])
                 if role:
@@ -379,7 +407,7 @@ class DiscoOps(commands.Cog):
                     return
             try:
                 role = await ctx.guild.create_role(
-                    name=f"Event: {event.name}",
+                    name=f"Event: {getattr(event, 'name', 'Event')}",
                     color=discord.Color.random(),
                     mentionable=True,
                     reason=f"Event role created by {ctx.author}"
@@ -394,20 +422,21 @@ class DiscoOps(commands.Cog):
                     except discord.Forbidden:
                         pass
                 await ctx.send(f"Created role {role.mention} and added to {added} interested members")
-                self.log_info(f"Created role {role.id} for event {event.id} in guild {ctx.guild.id}")
+                self.log_info(f"Created role {role.id} for event {event_id_str} in guild {ctx.guild.id}")
             except discord.Forbidden:
                 await ctx.send("I don't have permission to create roles.")
                 return
 
-        elif action == "sync":
+        elif action_l == "sync":
             if event_id_str not in event_roles:
-                await ctx.send(f"No role exists for event **{event.name}**. Use `create` first.")
+                await ctx.send(f"No role exists for event **{getattr(event, 'name', 'Event')}**. Use `create` first.")
                 return
             role = ctx.guild.get_role(event_roles[event_id_str])
             if not role:
-                await ctx.send(f"Role no longer exists for event **{event.name}**")
+                await ctx.send(f"Role no longer exists for event **{getattr(event, 'name', 'Event')}**")
                 async with self.config.guild(ctx.guild).event_roles() as roles:
-                    del roles[event_id_str]
+                    if event_id_str in roles:
+                        del roles[event_id_str]
                 return
 
             current_members = set(m.id for m in role.members)
@@ -435,23 +464,24 @@ class DiscoOps(commands.Cog):
                         pass
 
             await ctx.send(f"Sync complete for {role.mention} — Added: {added} • Removed: {removed}")
-            self.log_info(f"Synced role {role.id} for event {event.id} in guild {ctx.guild.id}: +{added}/-{removed}")
+            self.log_info(f"Synced role {role.id} for event {event_id_str} in guild {ctx.guild.id}: +{added}/-{removed}")
 
-        elif action == "delete":
+        elif action_l == "delete":
             if event_id_str not in event_roles:
-                await ctx.send(f"No role exists for event **{event.name}**")
+                await ctx.send(f"No role exists for event **{getattr(event, 'name', 'Event')}**")
                 return
             role = ctx.guild.get_role(event_roles[event_id_str])
             if role:
                 try:
                     await role.delete(reason=f"Event role deleted by {ctx.author}")
-                    await ctx.send(f"Deleted role for event **{event.name}**")
+                    await ctx.send(f"Deleted role for event **{getattr(event, 'name', 'Event')}**")
                 except discord.Forbidden:
                     await ctx.send("I don't have permission to delete this role.")
                     return
             async with self.config.guild(ctx.guild).event_roles() as roles:
-                del roles[event_id_str]
-            self.log_info(f"Deleted role for event {event.id} in guild {ctx.guild.id}")
+                if event_id_str in roles:
+                    del roles[event_id_str]
+            self.log_info(f"Deleted role for event {event_id_str} in guild {ctx.guild.id}")
 
     # ========== Debug / Logs (Owner Only) ==========
 
@@ -459,7 +489,12 @@ class DiscoOps(commands.Cog):
     @commands.is_owner()
     async def discoops_logs(self, ctx, count: Optional[int] = 10):
         """View recent in-memory logs. Default: 10"""
-        count = max(1, min(int(count or 10), 50))
+        try:
+            count = int(count or 10)
+        except Exception:
+            count = 10
+        count = max(1, min(count, 50))
+
         if not self.logs:
             await ctx.send("No logs recorded yet.")
             return
@@ -532,6 +567,16 @@ class DiscoOps(commands.Cog):
         embed.set_footer(text="Replace [p] with your bot's prefix | Group aliases: do event / do events")
         await ctx.send(embed=embed)
 
+# ---- Red setup compatibility (async vs sync) ----
+# Red 3.5+ expects an *async* setup(bot); older Red expects a *sync* setup(bot).
+# We provide both, exporting only the one that matches the runtime expectation.
 
-async def setup(bot):
-    await bot.add_cog(DiscoOps(bot))
+# Prefer async setup if Red will await it:
+try:
+    # Red 3.5+ calls and awaits async setup
+    async def setup(bot):
+        await bot.add_cog(DiscoOps(bot))
+except Exception:
+    # Fallback for older Red that imports a sync setup
+    def setup(bot):
+        bot.add_cog(DiscoOps(bot))
