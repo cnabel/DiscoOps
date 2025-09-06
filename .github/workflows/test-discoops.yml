@@ -23,7 +23,7 @@ jobs:
         python-version: ['3.8', '3.9', '3.10', '3.11']
     
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v3
     
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v4
@@ -31,7 +31,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
     
     - name: Cache pip packages
-      uses: actions/cache@v4
+      uses: actions/cache@v3
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
@@ -41,7 +41,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # Don't install discord.py or Red-DiscordBot for tests - we'll use mocks
+        pip install discord.py
+        pip install Red-DiscordBot
         pip install pytest pytest-asyncio pytest-cov pytest-mock
         pip install flake8 black isort
         
@@ -60,26 +61,10 @@ jobs:
       run: |
         isort --check-only cogs/discoops/ || true
     
-    - name: Debug - Check file structure
-      run: |
-        echo "Current directory:"
-        pwd
-        echo "Files in cogs/discoops:"
-        ls -la cogs/discoops/ || echo "Directory not found"
-        echo "Python version:"
-        python --version
-    
-    - name: Run simple import test
-      run: |
-        cd cogs/discoops
-        echo "Testing basic import..."
-        python test_simple.py || true
-    
     - name: Run unit tests
       run: |
         cd cogs/discoops
-        echo "Running full tests..."
-        python -m unittest test_discoops -v || (echo "Test failed with exit code $?"; exit 1)
+        python -m pytest test_discoops.py -v --cov=discoops --cov-report=xml --cov-report=term
     
     - name: Upload coverage reports to Codecov
       if: matrix.python-version == '3.10'
@@ -135,7 +120,7 @@ jobs:
         bandit -r cogs/discoops/ -f json -o bandit-report.json || true
     
     - name: Upload Bandit Report
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       if: always()
       with:
         name: bandit-security-report
