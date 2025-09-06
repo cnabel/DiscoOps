@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import asyncio
 from typing import Optional, Union, List
 from collections import deque
+import unicodedata
 
 
 class DiscoOps(commands.Cog):
@@ -28,6 +29,35 @@ class DiscoOps(commands.Cog):
     def log_info(self, message: str):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.logs.append(f"[{ts}] {message}")
+
+    # --------- helpers ----------
+    @staticmethod
+    def _norm_text(s: str) -> str:
+        """
+        Normalize text for comparisons:
+        - Unicode NFKC
+        - strip ASCII + smart quotes and surrounding whitespace
+        - casefold for better Unicode-insensitive match
+        """
+        if s is None:
+            return ""
+        s = unicodedata.normalize("NFKC", s).strip()
+        s = s.strip(' "\'“”‘’')  # remove surrounding quotes if present
+        return s.casefold()
+
+    @staticmethod
+    def _event_match(events: List[discord.ScheduledEvent], query: str) -> Optional[discord.ScheduledEvent]:
+        """Find event by normalized exact name, then partial match."""
+        nq = DiscoOps._norm_text(query)
+        # exact match
+        for e in events:
+            if DiscoOps._norm_text(e.name) == nq:
+                return e
+        # partial match
+        for e in events:
+            if nq in DiscoOps._norm_text(e.name):
+                return e
+        return None
 
     # ============= Command Group =============
 
@@ -57,7 +87,7 @@ class DiscoOps(commands.Cog):
         """
         self.log_info(f"{ctx.author} invoked 'members new' with amount={amount}, period={period} in guild {ctx.guild.id}")
 
-        period_l = period.lower()
+        period_l = (period or "").lower()
         if period_l not in ['days', 'day', 'weeks', 'week', 'months', 'month']:
             await ctx.send("Period must be 'days', 'weeks', or 'months'")
             self.log_info("Invalid period provided to 'members new'")
@@ -71,18 +101,17 @@ class DiscoOps(commands.Cog):
         else:  # months (approximate)
             delta = timedelta(days=amount * 30)
 
-        cutoff_date = datetime.utcnow() - delta
+        # Make cutoff tz-aware (UTC) to avoid naive/aware comparison errors
+        cutoff_date = datetime.now(timezone.utc) - delta
 
         # Try to access members; this needs the Server Members Intent
         try:
             members = list(ctx.guild.members)
             if not members:
-                # If cache is empty, try chunk (still requires intents.members)
                 try:
                     await ctx.guild.chunk()
                     members = list(ctx.guild.members)
                 except Exception as e:
-                    # continue; we’ll warn below
                     pass
         except Exception as e:
             members = []
@@ -96,16 +125,25 @@ class DiscoOps(commands.Cog):
             self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
             return
 
-        # Get members who joined after cutoff date
+        # Filter recent members (handle tz-awareness defensively)
         try:
-            recent_members = [m for m in members if getattr(m, "joined_at", None) and m.joined_at > cutoff_date]
+            recent_members = []
+            for m in members:
+                ja = getattr(m, "joined_at", None)
+                if not ja:
+                    continue
+                # Ensure tz-aware UTC for joined_at
+                if ja.tzinfo is None:
+                    ja = ja.replace(tzinfo=timezone.utc)
+                if ja > cutoff_date:
+                    recent_members.append((m, ja))
         except Exception as e:
             self.log_info(f"Error filtering recent members: {e}")
             await ctx.send("An error occurred while reading member join dates.")
             return
 
         # Sort by join date (most recent first)
-        recent_members.sort(key=lambda m: m.joined_at, reverse=True)
+        recent_members.sort(key=lambda tup: tup[1], reverse=True)
 
         if not recent_members:
             await ctx.send(f"No members joined in the last {amount} {period_l}.")
@@ -120,9 +158,9 @@ class DiscoOps(commands.Cog):
         )
 
         # Add members to embed (limit to 25 fields)
-        for i, member in enumerate(recent_members[:25]):
-            join_date = member.joined_at.strftime("%Y-%m-%d %H:%M UTC")
-            days_ago = (datetime.utcnow() - member.joined_at).days
+        for i, (member, ja) in enumerate(recent_members[:25]):
+            join_date = ja.strftime("%Y-%m-%d %H:%M UTC")
+            days_ago = (datetime.now(timezone.utc) - ja).days
             embed.add_field(
                 name=f"{i+1}. {member.display_name}",
                 value=f"ID: {member.id}\nJoined: {join_date}\n({days_ago} days ago)",
@@ -201,14 +239,13 @@ class DiscoOps(commands.Cog):
     @events_group.command(name="list")
     async def events_list(self, ctx):
         """List all scheduled events with name and description."""
-        # Get all scheduled events from the guild (with_counts=True to populate user_count)
         events: List[discord.ScheduledEvent] = await ctx.guild.fetch_scheduled_events(with_counts=True)
 
         if not events:
             await ctx.send("No scheduled events found in this server.")
             return
 
-        # --- sort by start time (earliest first); put None at the end ---
+        # sort by start time (earliest first); put None at the end
         far_future = datetime.max.replace(tzinfo=timezone.utc)
         events.sort(key=lambda e: e.start_time or far_future)
 
@@ -233,7 +270,6 @@ class DiscoOps(commands.Cog):
                 status_emoji = "❌"
                 status = "Cancelled"
 
-            # Interested users
             user_count = event.user_count or 0
 
             # Time formatting (Discord timestamp + raw epoch)
@@ -245,20 +281,19 @@ class DiscoOps(commands.Cog):
             else:
                 start_line = "N/A"
 
-            # Build field value
-            # Include copy-friendly name and a ready-to-copy quick command using that name
-            field_value = f"**Name:** `{event.name}`\n"
-            field_value += f"**Status:** {status_emoji} {status}\n"
-            field_value += f"**Start:** {start_line}\n"
-            field_value += f"**Interested:** {user_count} users\n"
-            field_value += f"**Quick command:** `[p]do events members \"{event.name}\"`\n"
+            # Field content (copy-friendly name + quick command)
+            field_value = (
+                f"**Name:** `{event.name}`\n"
+                f"**Status:** {status_emoji} {status}\n"
+                f"**Start:** {start_line}\n"
+                f"**Interested:** {user_count} users\n"
+                f"**Quick command:** `[p]do events members \"{event.name}\"`\n"
+            )
 
             if event.description:
-                # Truncate description if too long
                 desc = event.description[:200] + "..." if len(event.description) > 200 else event.description
                 field_value += f"**Description:** {desc}\n"
 
-            # Location (external events) or channel (voice/stage)
             if event.location:
                 field_value += f"**Location:** {event.location}\n"
             elif event.channel:
@@ -280,24 +315,14 @@ class DiscoOps(commands.Cog):
 
         Usage: [p]do events members <event_name>
         """
-        # Find the event by name
         events = await ctx.guild.fetch_scheduled_events(with_counts=True)
-        event = None
 
-        for e in events:
-            if e.name.lower() == event_name.lower():
-                event = e
-                break
-
-        if not event:
-            # Try partial match
-            for e in events:
-                if event_name.lower() in e.name.lower():
-                    event = e
-                    break
+        # Normalize and match (handles quotes/diacritics)
+        event = self._event_match(events, event_name)
 
         if not event:
             await ctx.send(f"Event '{event_name}' not found. Use `[p]do events list` to see all events.")
+            self.log_info(f"events members: not found for query={event_name!r}")
             return
 
         # Fetch users interested in the event
@@ -305,7 +330,7 @@ class DiscoOps(commands.Cog):
             interested_users = []
             async for user in event.users():
                 member = ctx.guild.get_member(user.id)
-                if member:  # Only include if they're still in the server
+                if member:
                     interested_users.append(member)
         except Exception as e:
             await ctx.send(f"Error fetching interested users: {e}")
@@ -329,7 +354,6 @@ class DiscoOps(commands.Cog):
                 inline=False
             )
 
-        # Add event details (copy-friendly name + times)
         if event.start_time:
             epoch = int(event.start_time.timestamp())
             start_line = f"<t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
@@ -352,7 +376,6 @@ class DiscoOps(commands.Cog):
         for i, member in enumerate(interested_users[:50], 1):
             member_list.append(f"{i}. {member.mention} ({member.display_name})")
 
-        # Split into chunks
         chunk_size = 15
         for i in range(0, len(member_list), chunk_size):
             chunk = member_list[i:i + chunk_size]
@@ -374,33 +397,18 @@ class DiscoOps(commands.Cog):
         Create, sync, or delete a role for event attendees.
 
         Usage: [p]do events role <create|sync|delete> <event_name>
-        Actions:
-        - create: Creates a new role for the event and adds all interested members
-        - sync: Updates the role to match current interested members
-        - delete: Removes the role associated with the event
         """
-        action = action.lower()
+        action = (action or "").lower()
         if action not in ['create', 'sync', 'delete']:
             await ctx.send("Action must be 'create', 'sync', or 'delete'")
             return
 
-        # Find the event
         events = await ctx.guild.fetch_scheduled_events(with_counts=True)
-        event = None
-
-        for e in events:
-            if e.name.lower() == event_name.lower():
-                event = e
-                break
-
-        if not event:
-            for e in events:
-                if event_name.lower() in e.name.lower():
-                    event = e
-                    break
+        event = self._event_match(events, event_name)
 
         if not event:
             await ctx.send(f"Event '{event_name}' not found. Use `[p]do events list` to see all events.")
+            self.log_info(f"events role: not found for query={event_name!r}")
             return
 
         # Get interested users
@@ -419,14 +427,11 @@ class DiscoOps(commands.Cog):
         event_id_str = str(event.id)
 
         if action == "create":
-            # Check if role already exists
             if event_id_str in event_roles:
                 role = ctx.guild.get_role(event_roles[event_id_str])
                 if role:
                     await ctx.send(f"Role already exists: {role.mention}")
                     return
-
-            # Create new role
             try:
                 role = await ctx.guild.create_role(
                     name=f"Event: {event.name}",
@@ -434,12 +439,8 @@ class DiscoOps(commands.Cog):
                     mentionable=True,
                     reason=f"Event role created by {ctx.author}"
                 )
-
-                # Save role ID
                 async with self.config.guild(ctx.guild).event_roles() as roles:
                     roles[event_id_str] = role.id
-
-                # Add role to all interested members
                 added = 0
                 for member in interested_users:
                     try:
@@ -447,10 +448,8 @@ class DiscoOps(commands.Cog):
                         added += 1
                     except discord.Forbidden:
                         pass
-
                 await ctx.send(f"✅ Created role {role.mention} and added to {added} interested members")
                 self.log_info(f"Created role {role.id} for event {event.id} in guild {ctx.guild.id}")
-
             except discord.Forbidden:
                 await ctx.send("❌ I don't have permission to create roles!")
                 return
@@ -459,7 +458,6 @@ class DiscoOps(commands.Cog):
             if event_id_str not in event_roles:
                 await ctx.send(f"No role exists for event **{event.name}**. Use `create` first.")
                 return
-
             role = ctx.guild.get_role(event_roles[event_id_str])
             if not role:
                 await ctx.send(f"Role no longer exists for event **{event.name}**")
@@ -467,17 +465,13 @@ class DiscoOps(commands.Cog):
                     del roles[event_id_str]
                 return
 
-            # Get current members with role
             current_members = set(m.id for m in role.members)
             interested_member_ids = set(m.id for m in interested_users)
 
-            # Members to add role to
             to_add = interested_member_ids - current_members
-            # Members to remove role from
             to_remove = current_members - interested_member_ids
 
             added = removed = 0
-
             for member_id in to_add:
                 member = ctx.guild.get_member(member_id)
                 if member:
@@ -486,7 +480,6 @@ class DiscoOps(commands.Cog):
                         added += 1
                     except discord.Forbidden:
                         pass
-
             for member_id in to_remove:
                 member = ctx.guild.get_member(member_id)
                 if member:
@@ -503,7 +496,6 @@ class DiscoOps(commands.Cog):
             if event_id_str not in event_roles:
                 await ctx.send(f"No role exists for event **{event.name}**")
                 return
-
             role = ctx.guild.get_role(event_roles[event_id_str])
             if role:
                 try:
@@ -512,11 +504,8 @@ class DiscoOps(commands.Cog):
                 except discord.Forbidden:
                     await ctx.send("❌ I don't have permission to delete this role!")
                     return
-
-            # Remove from config
             async with self.config.guild(ctx.guild).event_roles() as roles:
                 del roles[event_id_str]
-
             self.log_info(f"Deleted role for event {event.id} in guild {ctx.guild.id}")
 
     # ========== Debug / Logs (Owner Only) ==========
