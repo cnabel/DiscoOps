@@ -4,7 +4,7 @@ import discord
 from redbot.core import commands, Config
 from datetime import datetime, timedelta, timezone
 import asyncio
-from typing import Optional, Union, List
+from typing import Optional, List, Tuple, Deque
 from collections import deque
 import unicodedata
 
@@ -21,7 +21,8 @@ class DiscoOps(commands.Cog):
         }
         self.config.register_guild(**default_guild)
 
-        self.logs: deque[str] = deque(maxlen=1000)
+        # 3.8-friendly typing
+        self.logs: Deque[str] = deque(maxlen=1000)
 
     # --------- tiny internal logger ----------
     def log_info(self, message: str):
@@ -39,7 +40,7 @@ class DiscoOps(commands.Cog):
         return s.casefold()
 
     @staticmethod
-    def _event_match(events: List[discord.ScheduledEvent], query: str) -> Optional[discord.ScheduledEvent]:
+    def _event_match(events, query: str):
         """Find event by normalized exact name, then partial match."""
         nq = DiscoOps._norm_text(query)
         for e in events:
@@ -93,6 +94,7 @@ class DiscoOps(commands.Cog):
 
         cutoff_date = datetime.now(timezone.utc) - delta
 
+        # Access members (requires Server Members Intent)
         try:
             members = list(ctx.guild.members)
             if not members:
@@ -113,7 +115,7 @@ class DiscoOps(commands.Cog):
             return
 
         try:
-            recent: List[tuple[discord.Member, datetime]] = []
+            recent: List[Tuple[discord.Member, datetime]] = []
             for m in members:
                 ja = getattr(m, "joined_at", None)
                 if not ja:
@@ -134,7 +136,7 @@ class DiscoOps(commands.Cog):
             self.log_info("No recent members found")
             return
 
-        # README-like embed (headers + blockquote, no emojis/bullets)
+        # README-like embed (headers + blockquote)
         title = f"# New Members\n**Range:** last **{amount} {period_l}**  •  **Found:** {len(recent)}"
         embed = discord.Embed(
             title="",
@@ -149,7 +151,6 @@ class DiscoOps(commands.Cog):
                 f"> **ID**: `{member.id}`\n"
                 f"> **Joined**: <t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
             )
-            # Put the member name as a copy-friendly header line
             embed.add_field(
                 name=f"## `{member.display_name}`",
                 value=block,
@@ -169,14 +170,15 @@ class DiscoOps(commands.Cog):
         members_with_role = role.members
 
         header = f"# Members with role\n**Role:** `{role.name}`  •  **Total:** {len(members_with_role)}"
-        embed = discord.Embed(description=header, color=role.color if role.color.value else discord.Color.blue())
+        color = role.color if getattr(role.color, "value", 0) else discord.Color.blue()
+        embed = discord.Embed(description=header, color=color)
 
         if not members_with_role:
             embed.add_field(name="## Members", value="> None", inline=False)
         else:
-            # Group into chunks of 15
             chunk_size = 15
-            for i in range(0, min(len(members_with_role), 60), chunk_size):
+            limit = min(len(members_with_role), 60)
+            for i in range(0, limit, chunk_size):
                 chunk = members_with_role[i:i + chunk_size]
                 lines = [f"{i+j+1}. {m.mention} ({m.display_name})" for j, m in enumerate(chunk)]
                 embed.add_field(
@@ -217,7 +219,7 @@ class DiscoOps(commands.Cog):
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
         """List scheduled events (README style)."""
-        events: List[discord.ScheduledEvent] = await ctx.guild.fetch_scheduled_events(with_counts=True)
+        events = await ctx.guild.fetch_scheduled_events(with_counts=True)
         if not events:
             await ctx.send("No scheduled events found in this server.")
             return
@@ -238,23 +240,22 @@ class DiscoOps(commands.Cog):
             else:
                 start_line = "N/A"
 
-            summary = [
+            summary_lines = [
                 f"> **Status**: {status}",
                 f"> **Start**: {start_line}",
                 f"> **Interested**: {user_count}",
             ]
             if event.description:
                 desc = event.description[:200] + "..." if len(event.description) > 200 else event.description
-                summary.append(f"> **Description**: {desc}")
+                summary_lines.append(f"> **Description**: {desc}")
             if event.location:
-                summary.append(f"> **Location**: {event.location}")
+                summary_lines.append(f"> **Location**: {event.location}")
             elif event.channel:
-                summary.append(f"> **Channel**: {event.channel.mention}")
+                summary_lines.append(f"> **Channel**: {event.channel.mention}")
 
-            # Title line is just the copy-friendly header with backticked name
             embed.add_field(
                 name=f"## `{event.name}`",
-                value="\n".join(summary) + f"\n\n**Quick:** `[p]do event \"{event.name}\"`",
+                value="\n".join(summary_lines) + f"\n\n**Quick:** `[p]do event \"{event.name}\"`",
                 inline=False
             )
 
@@ -297,7 +298,6 @@ class DiscoOps(commands.Cog):
 
         user_count = event.user_count or 0
 
-        # Build README-like embed: title header, blockquote summary, then members
         title_header = f"# `{event.name}`"
         summary_block = (
             f"> **Status**: {status}\n"
@@ -318,7 +318,6 @@ class DiscoOps(commands.Cog):
         # Interested members
         if interested_users:
             lines = [f"{i}. {m.mention} ({m.display_name})" for i, m in enumerate(interested_users[:50], start=1)]
-            # Split into chunks to avoid field limits
             chunk_size = 15
             for i in range(0, len(lines), chunk_size):
                 chunk = lines[i:i + chunk_size]
