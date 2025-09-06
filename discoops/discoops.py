@@ -448,7 +448,7 @@ class DiscoOps(commands.Cog):
         embed = discord.Embed(
             title="🛠️ DiscoOps Help",
             description="Operational features for Discord server management",
-            color=discord.Color.blue()
+            color=0x3498db  # Blue color in hex
         )
         
         embed.add_field(
