@@ -8,6 +8,8 @@ from typing import Optional
 from collections import deque
 import unicodedata
 
+MAX_MSG = 1900  # stay safely below Discord's 2000 char limit
+
 class DiscoOps(commands.Cog):
     """Operational features to make Discord server management easier."""
 
@@ -39,16 +41,13 @@ class DiscoOps(commands.Cog):
     async def _get_scheduled_events(guild, with_counts: bool = True):
         """Safely fetch scheduled events across discord.py versions."""
         try:
-            # discord.py 2.x
             return await guild.fetch_scheduled_events(with_counts=with_counts)
         except TypeError:
-            # Some builds don’t support with_counts kwarg
             try:
                 return await guild.fetch_scheduled_events()
             except Exception:
                 return []
         except AttributeError:
-            # Very old discord.py without scheduled events
             return []
 
     @classmethod
@@ -62,6 +61,35 @@ class DiscoOps(commands.Cog):
             if nq in cls._norm_text(getattr(e, "name", "")):
                 return e
         return None
+
+    @staticmethod
+    async def _send_paginated(ctx, chunks, header=None, footer=None):
+        """
+        Send plain text chunks split below Discord's limit.
+        `chunks` can be a list of strings (sections).
+        """
+        header = header or ""
+        footer = footer or ""
+        pages = []
+        current = header + ("\n\n" if header else "")
+        for part in chunks:
+            sep = "" if current.endswith("\n") or current == "" else "\n"
+            addition = f"{sep}{part}"
+            if len(current) + len(addition) + (len("\n\n" + footer) if footer else 0) > MAX_MSG:
+                pages.append(current.rstrip())
+                current = part
+            else:
+                current += addition
+        if current.strip():
+            pages.append((current + ("\n\n" + footer if footer and len(current) + len("\n\n" + footer) <= MAX_MSG else "")).rstrip())
+
+        # If footer didn't fit on the last page, push separately
+        if footer and (not pages or not pages[-1].endswith(footer)):
+            pages.append(footer)
+
+        for page in pages:
+            if page.strip():
+                await ctx.send(page)
 
     # ============= Command Group =============
 
@@ -149,27 +177,20 @@ class DiscoOps(commands.Cog):
             self.log_info("No recent members found")
             return
 
-        # README-like embed (headers + blockquote)
-        title = f"# New Members\n**Range:** last **{amount} {period_l}**  •  **Found:** {len(recent)}"
-        embed = discord.Embed(title="", description=title, color=discord.Color.blue())
-
-        for i, (member, ja) in enumerate(recent[:25], start=1):
+        # Build plain markdown sections and paginate
+        header = f"# New Members\n**Range:** last **{amount} {period_l}**  •  **Found:** {len(recent)}"
+        sections = []
+        for (member, ja) in recent:
             epoch = int(ja.timestamp())
             block = (
+                f"## `{member.display_name}`\n"
                 f"> **Member**: {member.mention} ({member.display_name})\n"
                 f"> **ID**: `{member.id}`\n"
                 f"> **Joined**: <t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
             )
-            embed.add_field(
-                name=f"## `{member.display_name}`",
-                value=block,
-                inline=False
-            )
+            sections.append(block)
 
-        if len(recent) > 25:
-            embed.set_footer(text=f"Showing first 25 of {len(recent)} members")
-
-        await ctx.send(embed=embed)
+        await self._send_paginated(ctx, sections, header=header)
         self.log_info(f"Sent recent members list ({len(recent)} found)")
 
     @members_group.command(name="role")
@@ -179,34 +200,28 @@ class DiscoOps(commands.Cog):
         members_with_role = role.members
 
         header = f"# Members with role\n**Role:** `{role.name}`  •  **Total:** {len(members_with_role)}"
-        color = role.color if getattr(role.color, "value", 0) else discord.Color.blue()
-        embed = discord.Embed(description=header, color=color)
+        sections = []
 
         if not members_with_role:
-            embed.add_field(name="## Members", value="> None", inline=False)
+            sections.append("## Members\n> None")
         else:
-            chunk_size = 15
-            limit = min(len(members_with_role), 60)
-            for i in range(0, limit, chunk_size):
+            # Chunk the member list into readable blocks
+            chunk_size = 20
+            for i in range(0, len(members_with_role), chunk_size):
                 chunk = members_with_role[i:i + chunk_size]
                 lines = [f"{i+j+1}. {m.mention} ({m.display_name})" for j, m in enumerate(chunk)]
-                embed.add_field(
-                    name=f"## Members {i+1}-{i+len(chunk)}",
-                    value="\n".join(lines),
-                    inline=False
-                )
-            if len(members_with_role) > 60:
-                embed.set_footer(text=f"Showing first 60 of {len(members_with_role)} members")
+                sections.append(f"## Members {i+1}-{i+len(chunk)}\n" + "\n".join(lines))
 
         role_info = (
+            f"## Role Info\n"
             f"> **Created**: {role.created_at.strftime('%Y-%m-%d')}\n"
             f"> **Position**: {role.position}\n"
             f"> **Mentionable**: {'Yes' if role.mentionable else 'No'}\n"
             f"> **Color**: {str(role.color)}"
         )
-        embed.add_field(name="## Role Info", value=role_info, inline=False)
+        sections.append(role_info)
 
-        await ctx.send(embed=embed)
+        await self._send_paginated(ctx, sections, header=header)
         self.log_info(f"Sent members-with-role list ({len(members_with_role)} members)")
 
     # ========== Event Commands (Using Discord's Scheduled Events) ==========
@@ -216,9 +231,9 @@ class DiscoOps(commands.Cog):
         """
         Event management commands.
 
-        - `[p]do event list` — list scheduled events
-        - `[p]do event "Name"` — show summary + interested members
-        (Alias: `events` kept for backward compatibility.)
+        - `[p]do event list` — list scheduled events (plain messages, auto-paginated)
+        - `[p]do event "Name"` — show summary + interested members (plain messages, auto-paginated)
+        - `[p]do event role <create|sync|delete> "Name"`
         """
         if event_name:
             await self._event_info_with_members(ctx, event_name)
@@ -227,7 +242,7 @@ class DiscoOps(commands.Cog):
 
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
-        """List scheduled events (README style)."""
+        """List scheduled events as normal messages (no embed), with pagination."""
         events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         if not events:
             await ctx.send("No scheduled events found in this server.")
@@ -240,9 +255,9 @@ class DiscoOps(commands.Cog):
             pass
 
         header = f"# Scheduled Events\n**Total:** {len(events)}"
-        embed = discord.Embed(description=header, color=discord.Color.green())
-
+        sections = []
         for event in events:
+            name = getattr(event, "name", "Unnamed Event")
             status = getattr(event.status, "name", "UNKNOWN").title() if getattr(event, "status", None) else "UNKNOWN"
             user_count = getattr(event, "user_count", 0) or 0
 
@@ -255,7 +270,8 @@ class DiscoOps(commands.Cog):
             else:
                 start_line = "N/A"
 
-            lines = [
+            section = [
+                f"## `{name}`",
                 f"> **Status**: {status}",
                 f"> **Start**: {start_line}",
                 f"> **Interested**: {user_count}",
@@ -263,24 +279,20 @@ class DiscoOps(commands.Cog):
             desc = getattr(event, "description", None)
             if desc:
                 desc_short = desc[:200] + "..." if len(desc) > 200 else desc
-                lines.append(f"> **Description**: {desc_short}")
+                section.append(f"> **Description**: {desc_short}")
             if getattr(event, "location", None):
-                lines.append(f"> **Location**: {event.location}")
+                section.append(f"> **Location**: {event.location}")
             elif getattr(event, "channel", None):
                 try:
-                    lines.append(f"> **Channel**: {event.channel.mention}")
+                    section.append(f"> **Channel**: {event.channel.mention}")
                 except Exception:
                     pass
 
-            name = getattr(event, "name", "Unnamed Event")
-            embed.add_field(
-                name=f"## `{name}`",
-                value="\n".join(lines) + f"\n\n**Quick:** `[p]do event \"{name}\"`",
-                inline=False
-            )
+            section.append(f"\n**Quick:** `[p]do event \"{name}\"`")
+            sections.append("\n".join(section))
 
-        await ctx.send(embed=embed)
-        self.log_info(f"{ctx.author} listed events in guild {ctx.guild.id}")
+        await self._send_paginated(ctx, sections, header=header)
+        self.log_info(f"{ctx.author} listed events (plain messages) in guild {ctx.guild.id}")
 
     @event_group.command(name="members")  # deprecated path, kept for compatibility
     async def event_members_legacy(self, ctx, *, event_name: str):
@@ -289,7 +301,7 @@ class DiscoOps(commands.Cog):
         await self._event_info_with_members(ctx, event_name)
 
     async def _event_info_with_members(self, ctx, event_name: str):
-        """Show one event summary (README style) + interested members."""
+        """Show one event summary + interested members as plain messages (auto-paginated)."""
         events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         event = self._event_match(events, event_name)
         if not event:
@@ -324,7 +336,9 @@ class DiscoOps(commands.Cog):
         name = getattr(event, "name", "Unnamed Event")
         desc = getattr(event, "description", None)
 
-        title_header = f"# `{name}`"
+        header = f"# `{name}`"
+        sections = []
+
         summary_lines = [
             f"> **Status**: {status}",
             f"> **Start**: {start_line}",
@@ -344,26 +358,19 @@ class DiscoOps(commands.Cog):
             f"`[p]do event role sync \"{name}\"` • "
             f"`[p]do event role delete \"{name}\"`"
         )
+        sections.append("\n".join(summary_lines))
 
-        embed = discord.Embed(description=f"{title_header}\n\n" + "\n".join(summary_lines), color=discord.Color.blue())
-
-        # Interested members
+        # Interested members (chunk into sections)
         if interested_users:
-            lines = [f"{i}. {m.mention} ({m.display_name})" for i, m in enumerate(interested_users[:50], start=1)]
-            chunk_size = 15
+            lines = [f"{i}. {m.mention} ({m.display_name})" for i, m in enumerate(interested_users, start=1)]
+            chunk_size = 20
             for i in range(0, len(lines), chunk_size):
                 chunk = lines[i:i + chunk_size]
-                embed.add_field(
-                    name=f"## Interested Members {i+1}-{i+len(chunk)}",
-                    value="\n".join(chunk),
-                    inline=False
-                )
-            if len(interested_users) > 50:
-                embed.set_footer(text=f"Showing first 50 of {len(interested_users)} interested members")
+                sections.append(f"## Interested Members {i+1}-{i+len(chunk)}\n" + "\n".join(chunk))
         else:
-            embed.add_field(name="## Interested Members", value="> None", inline=False)
+            sections.append("## Interested Members\n> None")
 
-        await ctx.send(embed=embed)
+        await self._send_paginated(ctx, sections, header=header)
         self.log_info(f"{ctx.author} viewed event info for {getattr(event, 'id', 'unknown')} in guild {ctx.guild.id}")
 
     @event_group.command(name="role")
@@ -501,12 +508,21 @@ class DiscoOps(commands.Cog):
 
         lines = list(self.logs)[-count:]
         content = "\n".join(lines)
-        embed = discord.Embed(
-            title="DiscoOps Logs",
-            description=f"```\n{content}\n```",
-            color=discord.Color.dark_grey()
-        )
-        await ctx.send(embed=embed)
+        # logs can be long; paginate too
+        header = "# DiscoOps Logs"
+        # split the content into sections around newlines
+        raw_lines = content.split("\n")
+        chunks, cur = [], ""
+        for ln in raw_lines:
+            nxt = (cur + ("\n" if cur else "") + ln)
+            if len(nxt) > MAX_MSG:
+                chunks.append(cur)
+                cur = ln
+            else:
+                cur = nxt
+        if cur:
+            chunks.append(cur)
+        await self._send_paginated(ctx, chunks, header=header)
 
     @discoops.command(name="debug")
     @commands.is_owner()
@@ -515,29 +531,18 @@ class DiscoOps(commands.Cog):
         g = ctx.guild
         me = g.me
         perms = g.me.guild_permissions
-        embed = discord.Embed(title="DiscoOps Debug", color=discord.Color.orange())
-        embed.add_field(
-            name="Guild",
-            value=f"Name: {g.name}\nID: {g.id}\nMembers: {g.member_count}",
-            inline=False
+        msg = (
+            "# DiscoOps Debug\n"
+            f"**Guild**: {g.name} (ID {g.id})  •  **Members**: {g.member_count}\n\n"
+            f"**Bot**: {me} (ID {me.id})\n\n"
+            "## Key Permissions\n"
+            f"- Manage Roles: {perms.manage_roles}\n"
+            f"- Manage Guild: {perms.manage_guild}\n"
+            f"- View Audit Log: {perms.view_audit_log}\n"
+            f"- Send Messages: {perms.send_messages}\n"
+            f"- Embed Links: {perms.embed_links}\n"
         )
-        embed.add_field(
-            name="Bot",
-            value=f"Name: {me}\nID: {me.id}",
-            inline=False
-        )
-        embed.add_field(
-            name="Key Permissions",
-            value=(
-                f"Manage Roles: {perms.manage_roles}\n"
-                f"Manage Guild: {perms.manage_guild}\n"
-                f"View Audit Log: {perms.view_audit_log}\n"
-                f"Send Messages: {perms.send_messages}\n"
-                f"Embed Links: {perms.embed_links}"
-            ),
-            inline=False
-        )
-        await ctx.send(embed=embed)
+        await self._send_paginated(ctx, [msg])
 
     @discoops.command(name="clearlogs")
     @commands.is_owner()
@@ -550,33 +555,22 @@ class DiscoOps(commands.Cog):
     @discoops.command(name="help")
     async def discoops_help(self, ctx):
         """Show detailed help for DiscoOps commands."""
-        embed = discord.Embed(
-            title="DiscoOps Help",
-            description=(
-                "# Commands\n"
-                "## Members\n"
-                "`[p]do members new <amount> <days|weeks|months>` — List recent joins\n"
-                "`[p]do members role <@role>` — List members with a role\n\n"
-                "## Events\n"
-                "`[p]do event list` — List scheduled events\n"
-                "`[p]do event \"Event Name\"` — Show one event (+ members)\n"
-                "`[p]do event role <create|sync|delete> \"Event Name\"` — Manage event role"
-            ),
-            color=0x3498db
+        help_md = (
+            "# DiscoOps Help\n"
+            "## Members\n"
+            "`[p]do members new <amount> <days|weeks|months>` — List recent joins\n"
+            "`[p]do members role <@role>` — List members with a role\n\n"
+            "## Events\n"
+            "`[p]do event list` — List scheduled events (plain messages, paginated)\n"
+            "`[p]do event \"Event Name\"` — Show one event (+ members)\n"
+            "`[p]do event role <create|sync|delete> \"Event Name\"` — Manage event role\n"
         )
-        embed.set_footer(text="Replace [p] with your bot's prefix | Group aliases: do event / do events")
-        await ctx.send(embed=embed)
+        await self._send_paginated(ctx, [help_md])
 
 # ---- Red setup compatibility (async vs sync) ----
-# Red 3.5+ expects an *async* setup(bot); older Red expects a *sync* setup(bot).
-# We provide both, exporting only the one that matches the runtime expectation.
-
-# Prefer async setup if Red will await it:
 try:
-    # Red 3.5+ calls and awaits async setup
     async def setup(bot):
         await bot.add_cog(DiscoOps(bot))
 except Exception:
-    # Fallback for older Red that imports a sync setup
     def setup(bot):
         bot.add_cog(DiscoOps(bot))
