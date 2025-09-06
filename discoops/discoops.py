@@ -38,6 +38,14 @@ class DiscoOps(commands.Cog):
         return s.casefold()
 
     @staticmethod
+    def _quote_lines(text: str) -> str:
+        """Prefix every line with '> ' to keep multi-line descriptions inside the quote."""
+        if not text:
+            return ""
+        lines = text.splitlines()
+        return "\n".join("> " + ln for ln in lines)
+
+    @staticmethod
     async def _get_scheduled_events(guild, with_counts: bool = True):
         """Safely fetch scheduled events across discord.py versions."""
         try:
@@ -183,7 +191,7 @@ class DiscoOps(commands.Cog):
         for (member, ja) in recent:
             epoch = int(ja.timestamp())
             block = (
-                f"## `{member.display_name}`\n"
+                f"## {member.display_name}\n"
                 f"> **Member**: {member.mention} ({member.display_name})\n"
                 f"> **ID**: `{member.id}`\n"
                 f"> **Joined**: <t:{epoch}:F> • <t:{epoch}:R> (unix: `{epoch}`)"
@@ -270,26 +278,30 @@ class DiscoOps(commands.Cog):
             else:
                 start_line = "N/A"
 
-            section = [
-                f"## `{name}`",
-                f"> **Status**: {status}",
-                f"> **Start**: {start_line}",
-                f"> **Interested**: {user_count}",
-            ]
             desc = getattr(event, "description", None)
+            desc_block = ""
             if desc:
-                desc_short = desc[:200] + "..." if len(desc) > 200 else desc
-                section.append(f"> **Description**: {desc_short}")
+                short = desc if len(desc) <= 200 else desc[:200] + "..."
+                desc_block = "\n" + self._quote_lines(short)
+
+            location_line = ""
             if getattr(event, "location", None):
-                section.append(f"> **Location**: {event.location}")
+                location_line = f"\n> **Location**: {event.location}"
             elif getattr(event, "channel", None):
                 try:
-                    section.append(f"> **Channel**: {event.channel.mention}")
+                    location_line = f"\n> **Channel**: {event.channel.mention}"
                 except Exception:
                     pass
 
-            section.append(f"\n**Quick:** `[p]do event \"{name}\"`")
-            sections.append("\n".join(section))
+            section = (
+                f"## {name}\n"
+                f"> **Status**: {status}\n"
+                f"> **Start**: {start_line}\n"
+                f"> **Interested**: {user_count}"
+                f"{desc_block}"
+                f"{location_line}"
+            )
+            sections.append(section)
 
         await self._send_paginated(ctx, sections, header=header)
         self.log_info(f"{ctx.author} listed events (plain messages) in guild {ctx.guild.id}")
@@ -332,43 +344,48 @@ class DiscoOps(commands.Cog):
         else:
             start_line = "N/A"
 
-        user_count = getattr(event, "user_count", 0) or 0
+        total_interested = len(interested_users)
         name = getattr(event, "name", "Unnamed Event")
         desc = getattr(event, "description", None)
 
-        header = f"# `{name}`"
+        header = f"# {name}"
         sections = []
 
-        summary_lines = [
-            f"> **Status**: {status}",
-            f"> **Start**: {start_line}",
-            f"> **Interested**: {user_count}",
-        ]
+        # Summary block (keep multi-line desc inside blockquote)
+        desc_block = ""
         if desc:
-            summary_lines.append(f"> **Description**: {desc[:1024]}")
+            desc_block = "\n" + self._quote_lines(desc[:1024])
+
+        location_line = ""
         if getattr(event, "location", None):
-            summary_lines.append(f"> **Location**: {event.location}")
+            location_line = f"\n> **Location**: {event.location}"
         elif getattr(event, "channel", None):
             try:
-                summary_lines.append(f"> **Channel**: {event.channel.mention}")
+                location_line = f"\n> **Channel**: {event.channel.mention}"
             except Exception:
                 pass
-        summary_lines.append(
-            f"> **Role**: `[p]do event role create \"{name}\"` • "
-            f"`[p]do event role sync \"{name}\"` • "
-            f"`[p]do event role delete \"{name}\"`"
+
+        summary = (
+            f"> **Status**: {status}\n"
+            f"> **Start**: {start_line}\n"
+            f"> **Interested**: {total_interested}"
+            f"{desc_block}"
+            f"{location_line}"
         )
-        sections.append("\n".join(summary_lines))
+        sections.append(summary)
 
         # Interested members (chunk into sections)
-        if interested_users:
+        if total_interested:
             lines = [f"{i}. {m.mention} ({m.display_name})" for i, m in enumerate(interested_users, start=1)]
             chunk_size = 20
-            for i in range(0, len(lines), chunk_size):
-                chunk = lines[i:i + chunk_size]
-                sections.append(f"## Interested Members {i+1}-{i+len(chunk)}\n" + "\n".join(chunk))
+            for idx in range(0, len(lines), chunk_size):
+                chunk = lines[idx:idx + chunk_size]
+                if idx == 0:
+                    sections.append(f"## Interested Members {total_interested}\n" + "\n".join(chunk))
+                else:
+                    sections.append("## Interested Members (continued)\n" + "\n".join(chunk))
         else:
-            sections.append("## Interested Members\n> None")
+            sections.append("## Interested Members 0\n> None")
 
         await self._send_paginated(ctx, sections, header=header)
         self.log_info(f"{ctx.author} viewed event info for {getattr(event, 'id', 'unknown')} in guild {ctx.guild.id}")
