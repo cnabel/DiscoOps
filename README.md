@@ -18,13 +18,13 @@ Outputs are plain Markdown messages (not embeds) with automatic pagination under
 
 ## Installation
 
-1. **Add the repository to your Red Bot:**
+1. **Add the repository to your Red Bot:**  
 ```[p]repo add DiscoOps https://github.com/yourusername/DiscoOps```
 
-2. **Install the cog:**
+2. **Install the cog:**  
 ```[p]cog install DiscoOps discoops```
 
-3. **Load the cog:**
+3. **Load the cog:**  
 ```[p]load discoops```
 
 ## Commands
@@ -37,22 +37,22 @@ For events, **event is primary**; events remains as an alias.
 
 #### View Recent Members
 List members who joined within a time window:
-```[p]do members new 7 days```
-```[p]do members new 2 weeks```
+```[p]do members new 7 days```  
+```[p]do members new 2 weeks```  
 ```[p]do members new 1 month```
 
 - Output shows each member with ID and join time as Discord timestamp (<t:...>) and unix epoch.
 
 #### Analyze Roles
-Show members with a specific role:
-```[p]do members role @Moderator```
-```[p]do members role @Verified```
+Show members with a specific role:  
+```[p]do members role @Moderator```  
+```[p]do members role @Verified```  
 ```[p]do members role "Game Night"```
 
 ### Event Commands
 
 #### List All Events
-Plain-message list, sorted by start time (soonest first):
+Plain-message list, sorted by start time (soonest first):  
 ```[p]do event list```
 
 - Event titles are headers one level below the main “Scheduled Events” header.
@@ -61,46 +61,46 @@ Plain-message list, sorted by start time (soonest first):
 - Auto-paginated if needed.
 
 #### Show One Event (Summary + Interested Members)
-Combined summary and attendance in one command:
-```[p]do event "Game Night"```
+Combined summary and attendance in one command:  
+```[p]do event "Game Night"```  
 ```[p]do event Rådsmötet```
 
 - Displays: status, start time, interested count, (multi-line) description, location/channel.
 - Interested Members N header shows the total; additional pages are labeled “(continued)”.
 
 #### Manage Event Roles
-(Optional workflow—no hints are auto-printed in outputs.)
-```[p]do event role create "Game Night"```
-```[p]do event role sync "Game Night"```
+(Optional workflow—no hints are auto-printed in outputs.)  
+```[p]do event role create "Game Night"```  
+```[p]do event role sync "Game Night"```  
 ```[p]do event role delete "Game Night"```
 
-### Debug / Logs (Owner Only)
-```[p]do logs [count]```   # default 10; paginated if long
-```[p]do debug```          # basic environment and permission info (plain text)
+### Debug / Logs (Owner Only)  
+```[p]do logs [count]```   # default 10; paginated if long  
+```[p]do debug```          # basic environment and permission info (plain text)  
 ```[p]do clearlogs```      # clear in-memory logs
 
 ### Help
-```[p]do help```
+```[p]do help```  
 
 ## Practical Usage Examples
 
 ### Weekly New Member Report
-```[p]do members new 7 days```
+```[p]do members new 7 days```  
 
 ### Event Management Workflow
 1) Create a Scheduled Event in Discord.  
 2) Get exact names:
-```[p]do event list```
-3) Create a role for an event (optional):
-```[p]do event role create "Friday Game Night"```
-4) Before the event, sync attendees:
-```[p]do event role sync "Friday Game Night"```
-5) After the event, clean up:
+```[p]do event list```  
+3) Create a role for an event (optional):  
+```[p]do event role create "Friday Game Night"```  
+4) Before the event, sync attendees:  
+```[p]do event role sync "Friday Game Night"```  
+5) After the event, clean up:  
 ```[p]do event role delete "Friday Game Night"```
 
-### Role Audit
-```[p]do members role @Moderator```
-```[p]do members role @VIP```
+### Role Audit  
+```[p]do members role @Moderator```  
+```[p]do members role @VIP```  
 ```[p]do members role @Subscriber```
 
 ## Behavior & Formatting
@@ -136,8 +136,8 @@ User (to run DiscoOps commands):
 - Ensure the bot has Server Members Intent enabled and has had time to cache members.
 
 ### “Event not found”
-Run:
-```[p]do event list```
+Run:  
+```[p]do event list```  
 Copy the event name exactly (quotes/diacritics are supported). Partial names also work in most cases.
 
 ### Role creation/sync/delete problems
