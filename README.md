@@ -36,7 +36,7 @@ For events, **event is primary**; events remains as an alias.
 ### Member Commands
 
 #### View Recent Members
-List members who joined within a time window:
+List members who joined within a time window:  
 ```[p]do members new 7 days```  
 ```[p]do members new 2 weeks```  
 ```[p]do members new 1 month```
@@ -68,7 +68,7 @@ Combined summary and attendance in one command:
 - Displays: status, start time, interested count, (multi-line) description, location/channel.
 - Interested Members N header shows the total; additional pages are labeled “(continued)”.
 
-#### Manage Event Roles
+#### Manage Event Roles  
 (Optional workflow—no hints are auto-printed in outputs.)  
 ```[p]do event role create "Game Night"```  
 ```[p]do event role sync "Game Night"```  
@@ -79,17 +79,17 @@ Combined summary and attendance in one command:
 ```[p]do debug```          # basic environment and permission info (plain text)  
 ```[p]do clearlogs```      # clear in-memory logs
 
-### Help
-```[p]do help```  
+### Help  
+```[p]do help```
 
 ## Practical Usage Examples
 
-### Weekly New Member Report
-```[p]do members new 7 days```  
+### Weekly New Member Report  
+```[p]do members new 7 days```
 
-### Event Management Workflow
+### Event Management Workflow  
 1) Create a Scheduled Event in Discord.  
-2) Get exact names:
+2) Get exact names:  
 ```[p]do event list```  
 3) Create a role for an event (optional):  
 ```[p]do event role create "Friday Game Night"```  
@@ -135,7 +135,7 @@ User (to run DiscoOps commands):
 ### “No members joined in the last X …”
 - Ensure the bot has Server Members Intent enabled and has had time to cache members.
 
-### “Event not found”
+### “Event not found”  
 Run:  
 ```[p]do event list```  
 Copy the event name exactly (quotes/diacritics are supported). Partial names also work in most cases.
@@ -144,7 +144,7 @@ Copy the event name exactly (quotes/diacritics are supported). Partial names als
 - Confirm the bot has Manage Roles and its role is above the roles it needs to assign/remove.
 
 ### Commands not working
-- Verify the cog is loaded: [p]cog list
+- Verify the cog is loaded: ```[p]cog list```
 - Check the channel’s bot permissions (Send Messages, View Channels)
 - Ensure you have Manage Server
 
