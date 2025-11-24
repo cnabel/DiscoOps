@@ -19,7 +19,7 @@ Outputs are plain Markdown messages (not embeds) with automatic pagination under
 ## Installation
 
 1. **Add the repository to your Red Bot:**  
-```[p]repo add DiscoOps https://github.com/yourusername/DiscoOps```
+```[p]repo add DiscoOps https://github.com/cnabel/DiscoOps```
 
 2. **Install the cog:**  
 ```[p]cog install DiscoOps discoops```
