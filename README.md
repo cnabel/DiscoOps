@@ -74,6 +74,24 @@ Combined summary and attendance in one command:
 ```[p]do event role sync "Game Night"```  
 ```[p]do event role delete "Game Night"```
 
+#### Detailed Event Wizard  
+Create detailed event posts with a wizard workflow:  
+```[p]do event create```
+
+The wizard guides you through:
+1. **Link Calendar Event** — Optionally import details from an existing Discord Scheduled Event
+2. **Edit Description** — Add a detailed description with markdown support
+3. **Roles Builder** — Add custom participation roles (e.g., Tank, Healer, DPS) with optional capacity limits
+4. **Options** — Configure calendar sync behavior
+5. **Publish** — Publish the event with a discussion thread
+
+Features:
+- Live preview embed that updates as you configure the event
+- Import event details (title, date, location, description, image) from Discord Scheduled Events
+- Add role options with emoji, labels, capacity limits, and descriptions
+- Option to sync edits back to the linked calendar event
+- Automatic discussion thread creation on publish
+
 ### Debug / Logs (Owner Only)  
 ```[p]do logs [count]```   # default 10; paginated if long  
 ```[p]do debug```          # basic environment and permission info (plain text)  
