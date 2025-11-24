@@ -452,15 +452,9 @@ class DiscoOps(commands.Cog):
                 if interaction.user.id != draft.creator_id:
                     return await interaction.response.send_message("Only the organizer can refresh.", ephemeral=True)
                 new_list = await outer._get_scheduled_events(interaction.guild, with_counts=False)
-                self.clear_items()
-                if new_list:
-                    self.scheduled_events = list(new_list)
-                    self.add_item(self._build_select())
-                # Re-add buttons
-                self.add_item(discord.ui.Button(label="Refresh list", style=discord.ButtonStyle.secondary))
-                self.add_item(discord.ui.Button(label="Paste event ID/URL", style=discord.ButtonStyle.primary))
-                self.add_item(discord.ui.Button(label="Create without calendar", style=discord.ButtonStyle.secondary))
-                await interaction.response.edit_message(view=self)
+                # Create a new view instead of trying to re-add buttons
+                new_view = EventPicker(new_list if new_list else [])
+                await interaction.response.edit_message(view=new_view)
 
             @discord.ui.button(label="Paste event ID/URL", style=discord.ButtonStyle.primary)
             async def paste(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -546,8 +540,8 @@ class DiscoOps(commands.Cog):
         await self._refresh_preview(interaction.guild, draft)
         await self._open_description_modal_followup(interaction, draft)
 
-    async def _open_description_modal(self, interaction: discord.Interaction, draft: EventDraft):
-        """Open the description editing modal (as response)."""
+    def _create_description_modal(self, draft: EventDraft):
+        """Create a description modal for the given draft."""
         outer = self
 
         class DescriptionModal(discord.ui.Modal, title="Event Description"):
@@ -565,26 +559,15 @@ class DiscoOps(commands.Cog):
                 await inter.response.send_message("Description saved.", ephemeral=True)
                 await outer._refresh_preview(inter.guild, draft)
 
-        await interaction.response.send_modal(DescriptionModal())
+        return DescriptionModal()
+
+    async def _open_description_modal(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open the description editing modal (as response)."""
+        await interaction.response.send_modal(self._create_description_modal(draft))
 
     async def _open_description_modal_followup(self, interaction: discord.Interaction, draft: EventDraft):
         """Open the description editing modal (as followup after another response)."""
         outer = self
-
-        class DescriptionModal(discord.ui.Modal, title="Event Description"):
-            description = discord.ui.TextInput(
-                label="Long description (markdown ok)",
-                style=discord.TextStyle.long,
-                required=False,
-                max_length=4000,
-                placeholder="Add details, agenda, requirements, links…",
-                default=draft.description_md or ""
-            )
-
-            async def on_submit(self, inter: discord.Interaction):
-                draft.description_md = str(self.description)
-                await inter.response.send_message("Description saved.", ephemeral=True)
-                await outer._refresh_preview(inter.guild, draft)
 
         # Send a button to open the modal since we can't send a modal from followup
         class OpenModalView(discord.ui.View):
@@ -595,7 +578,7 @@ class DiscoOps(commands.Cog):
             async def open_modal(self, inter: discord.Interaction, button: discord.ui.Button):
                 if inter.user.id != draft.creator_id:
                     return await inter.response.send_message("Only the organizer can edit.", ephemeral=True)
-                await inter.response.send_modal(DescriptionModal())
+                await inter.response.send_modal(outer._create_description_modal(draft))
 
         await interaction.followup.send("Click to edit the event description:", view=OpenModalView(), ephemeral=True)
 
