@@ -24,21 +24,36 @@ class DiscoOps(commands.Cog):
         self.config = Config.get_conf(self, identifier=260288776360820736)
         default_guild = {"event_roles": {}}  # Maps event_id to role_id
         self.config.register_guild(**default_guild)
+        # Global config for persistence across restarts
+        default_global = {"log_writes": 0}
+        self.config.register_global(**default_global)
 
         # Disk logging setup
         self._log_lock = asyncio.Lock()
-        self._log_writes = 0
+        self._log_writes = None  # Loaded from config in _ensure_log_writes_loaded
         data_dir = cog_data_path(self)
         data_dir.mkdir(parents=True, exist_ok=True)
         self._log_path = data_dir / "discoops.log"
 
     # --------- disk logger ----------
+    async def _ensure_log_writes_loaded(self):
+        """Load log_writes from persistent config if not already loaded."""
+        if self._log_writes is None:
+            self._log_writes = await self.config.log_writes()
+
+    async def _persist_log_writes(self):
+        """Save log_writes to persistent config."""
+        await self.config.log_writes.set(self._log_writes)
+
     async def log_info(self, message: str):
         """Append a log line to disk, with rotation + retention."""
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         line = f"[{ts}] {message}\n"
         try:
             async with self._log_lock:
+                # Ensure log_writes counter is loaded from persistent storage
+                await self._ensure_log_writes_loaded()
+
                 # Append
                 with open(self._log_path, "a", encoding="utf-8", newline="") as f:
                     f.write(line)
@@ -54,6 +69,9 @@ class DiscoOps(commands.Cog):
                     # Re-enforce size cap after time prune
                     if self._log_path.exists() and self._log_path.stat().st_size > MAX_LOG_BYTES:
                         self._truncate_to_max_bytes()
+
+                # Persist the updated counter
+                await self._persist_log_writes()
         except (IOError, OSError):
             # File I/O errors - don't disrupt bot flow
             pass
