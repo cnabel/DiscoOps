@@ -114,8 +114,8 @@ class DiscoOps(commands.Cog):
                                 kept_lines.append(ln)
                         else:
                             kept_lines.append(ln)
-                    except (ValueError, AttributeError):
-                        # Timestamp parsing failed, keep the line
+                    except ValueError:
+                        # Timestamp parsing failed (strptime), keep the line
                         kept_lines.append(ln)
             # Write back
             with open(p, "w", encoding="utf-8", newline="") as f:
