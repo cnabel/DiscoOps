@@ -570,14 +570,24 @@ class DiscoOps(commands.Cog):
                     roles[event_id_str] = role.id
                 
                 # Check role hierarchy before attempting to assign
-                if ctx.guild.me.top_role <= role:
+                # Bot can manage roles below its highest role (not equal)
+                if ctx.guild.me.top_role < role:
+                    # Delete the unusable role
+                    try:
+                        await role.delete(reason="Role hierarchy issue - bot cannot manage this role")
+                    except discord.Forbidden:
+                        pass
+                    # Remove from config
+                    async with self.config.guild(ctx.guild).event_roles() as roles:
+                        if event_id_str in roles:
+                            del roles[event_id_str]
                     await ctx.send(
-                        f"⚠️ **Role Hierarchy Issue**\n"
-                        f"Created role {role.mention}, but it's at or above my highest role.\n"
-                        f"I won't be able to assign it to members.\n\n"
-                        f"**To fix:** Go to Server Settings → Roles and drag my role above the event role."
+                        f"❌ **Role Hierarchy Issue**\n"
+                        f"The created role would be at or above my highest role, which prevents me from managing it.\n"
+                        f"Role has been deleted.\n\n"
+                        f"**To fix:** Go to Server Settings → Roles and drag my role higher, then try again."
                     )
-                    await self.log_info(f"Role hierarchy issue: bot role {ctx.guild.me.top_role.name} <= event role {role.name}")
+                    await self.log_info(f"Role hierarchy issue: bot role {ctx.guild.me.top_role.name} below event role - deleted role")
                     return
                 
                 added = 0
