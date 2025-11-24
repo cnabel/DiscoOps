@@ -38,8 +38,12 @@ class DiscoOps(commands.Cog):
 
     async def cog_unload(self):
         """Persist the log_writes counter when the cog is unloaded."""
-        if self._log_writes is not None:
-            await self._persist_log_writes()
+        try:
+            if self._log_writes is not None:
+                await self._persist_log_writes()
+        except Exception:
+            # Don't block unload if persistence fails
+            pass
 
     # --------- disk logger ----------
     async def _ensure_log_writes_loaded(self):
