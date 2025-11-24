@@ -54,8 +54,8 @@ class DiscoOps(commands.Cog):
                     # Re-enforce size cap after time prune
                     if self._log_path.exists() and self._log_path.stat().st_size > MAX_LOG_BYTES:
                         self._truncate_to_max_bytes()
-        except (IOError, OSError) as e:
-            # File I/O errors - don't disrupt bot flow but could log to stderr in dev
+        except (IOError, OSError):
+            # File I/O errors - don't disrupt bot flow
             pass
         except Exception:
             # Unexpected errors in logging - still don't disrupt bot flow
@@ -269,9 +269,14 @@ class DiscoOps(commands.Cog):
                 except discord.HTTPException:
                     # Chunking failed, continue with empty list
                     pass
-        except (AttributeError, discord.Forbidden) as e:
+        except AttributeError as e:
+            # Programming error - guild.members not available
             members = []
-            await self.log_info(f"Error accessing guild members: {e}")
+            await self.log_info(f"AttributeError accessing guild members: {e}")
+        except discord.Forbidden as e:
+            # Permission error - missing Server Members Intent
+            members = []
+            await self.log_info(f"Forbidden error accessing guild members: {e}")
 
         if not members:
             await ctx.send(
@@ -570,8 +575,8 @@ class DiscoOps(commands.Cog):
                     roles[event_id_str] = role.id
                 
                 # Check role hierarchy before attempting to assign
-                # Bot can manage roles below its highest role (not equal)
-                if ctx.guild.me.top_role < role:
+                # Bot can only manage roles strictly below its highest role
+                if ctx.guild.me.top_role <= role:
                     # Delete the unusable role
                     try:
                         await role.delete(reason="Role hierarchy issue - bot cannot manage this role")
