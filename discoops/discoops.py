@@ -54,8 +54,11 @@ class DiscoOps(commands.Cog):
                     # Re-enforce size cap after time prune
                     if self._log_path.exists() and self._log_path.stat().st_size > MAX_LOG_BYTES:
                         self._truncate_to_max_bytes()
+        except (IOError, OSError) as e:
+            # File I/O errors - don't disrupt bot flow but could log to stderr in dev
+            pass
         except Exception:
-            # Silently ignore logging errors to not disrupt bot flow
+            # Unexpected errors in logging - still don't disrupt bot flow
             pass
 
     def _truncate_to_max_bytes(self):
@@ -83,7 +86,8 @@ class DiscoOps(commands.Cog):
                 tail_text = tail_text[first_nl + 1 :]
             with open(p, "w", encoding="utf-8", newline="") as f:
                 f.write(tail_text)
-        except Exception:
+        except (IOError, OSError, UnicodeDecodeError):
+            # File operations can fail, but we don't want to break log truncation
             pass
 
     def _time_prune_older_than(self, days: int):
@@ -110,12 +114,14 @@ class DiscoOps(commands.Cog):
                                 kept_lines.append(ln)
                         else:
                             kept_lines.append(ln)
-                    except Exception:
+                    except (ValueError, AttributeError):
+                        # Timestamp parsing failed, keep the line
                         kept_lines.append(ln)
             # Write back
             with open(p, "w", encoding="utf-8", newline="") as f:
                 f.writelines(kept_lines)
-        except Exception:
+        except (IOError, OSError, UnicodeDecodeError):
+            # File operations can fail during pruning
             pass
 
     async def _logs_tail(self, count: int) -> str:
@@ -133,7 +139,7 @@ class DiscoOps(commands.Cog):
                 blob = f.read().decode("utf-8", errors="ignore")
             lines = [ln for ln in blob.splitlines() if ln.strip()]
             return "\n".join(lines[-count:]) if lines else ""
-        except Exception:
+        except (IOError, OSError, UnicodeDecodeError):
             return ""
 
     # --------- helpers ----------
@@ -160,11 +166,13 @@ class DiscoOps(commands.Cog):
         try:
             return await guild.fetch_scheduled_events(with_counts=with_counts)
         except TypeError:
+            # Older discord.py version doesn't support with_counts parameter
             try:
                 return await guild.fetch_scheduled_events()
-            except Exception:
+            except (discord.Forbidden, discord.HTTPException):
                 return []
-        except AttributeError:
+        except (AttributeError, discord.Forbidden, discord.HTTPException):
+            # Guild doesn't have scheduled events feature or bot lacks permissions
             return []
 
     @classmethod
@@ -258,9 +266,10 @@ class DiscoOps(commands.Cog):
                 try:
                     await ctx.guild.chunk()
                     members = list(ctx.guild.members)
-                except Exception:
+                except discord.HTTPException:
+                    # Chunking failed, continue with empty list
                     pass
-        except Exception as e:
+        except (AttributeError, discord.Forbidden) as e:
             members = []
             await self.log_info(f"Error accessing guild members: {e}")
 
@@ -290,7 +299,11 @@ class DiscoOps(commands.Cog):
         recent.sort(key=lambda tup: tup[1], reverse=True)
 
         if not recent:
-            await ctx.send(f"No members joined in the last {amount} {period_l}.")
+            await ctx.send(
+                f"ℹ️ No members joined in the last {amount} {period_l}.\n\n"
+                f"**Note:** Make sure the bot has been running and has cached member data. "
+                f"Members who joined before the bot was added won't be tracked."
+            )
             await self.log_info("No recent members found")
             return
 
@@ -426,7 +439,11 @@ class DiscoOps(commands.Cog):
         events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         event = self._event_match(events, event_name)
         if not event:
-            await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
+            await ctx.send(
+                f"❌ **Event Not Found:** '{event_name}'\n\n"
+                f"**Tip:** Use `[p]do event list` to see all scheduled events, then copy the exact event name.\n"
+                f"**Note:** Event names are case-insensitive and support partial matches."
+            )
             await self.log_info(f"event info: not found for query={event_name!r}")
             return
 
@@ -513,7 +530,11 @@ class DiscoOps(commands.Cog):
         events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         event = self._event_match(events, event_name)
         if not event:
-            await ctx.send(f"Event '{event_name}' not found. Use `[p]do event list` to see all events.")
+            await ctx.send(
+                f"❌ **Event Not Found:** '{event_name}'\n\n"
+                f"**Tip:** Use `[p]do event list` to see all scheduled events, then copy the exact event name.\n"
+                f"**Note:** Event names are case-insensitive and support partial matches."
+            )
             await self.log_info(f"event role: not found for query={event_name!r}")
             return
 
@@ -547,6 +568,18 @@ class DiscoOps(commands.Cog):
                 )
                 async with self.config.guild(ctx.guild).event_roles() as roles:
                     roles[event_id_str] = role.id
+                
+                # Check role hierarchy before attempting to assign
+                if ctx.guild.me.top_role <= role:
+                    await ctx.send(
+                        f"⚠️ **Role Hierarchy Issue**\n"
+                        f"Created role {role.mention}, but it's at or above my highest role.\n"
+                        f"I won't be able to assign it to members.\n\n"
+                        f"**To fix:** Go to Server Settings → Roles and drag my role above the event role."
+                    )
+                    await self.log_info(f"Role hierarchy issue: bot role {ctx.guild.me.top_role.name} <= event role {role.name}")
+                    return
+                
                 added = 0
                 for member in interested_users:
                     try:
@@ -557,7 +590,12 @@ class DiscoOps(commands.Cog):
                 await ctx.send(f"Created role {role.mention} and added to {added} interested members")
                 await self.log_info(f"Created role {role.id} for event {event_id_str} in guild {ctx.guild.id}")
             except discord.Forbidden:
-                await ctx.send("I don't have permission to create roles.")
+                await ctx.send(
+                    "❌ **Permission Error**\n"
+                    "I don't have permission to create roles.\n\n"
+                    "**Required Permission:** Manage Roles\n"
+                    "**How to Fix:** Go to Server Settings → Roles → [My Role] and enable 'Manage Roles'"
+                )
                 return
 
         elif action_l == "sync":
