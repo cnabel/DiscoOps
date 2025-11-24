@@ -14,6 +14,7 @@ MAX_MSG = 1900  # stay safely below Discord's 2000 char limit
 MAX_LOG_BYTES = 1_000_000  # 1 MB cap for on-disk log
 MAX_LOG_DAYS = 14          # delete entries older than 14 days
 CLEANUP_EVERY_WRITES = 50  # run time-based cleanup every N writes
+PERSIST_COUNTER_EVERY = 10 # persist log_writes counter every N writes to reduce I/O
 
 
 class DiscoOps(commands.Cog):
@@ -34,6 +35,11 @@ class DiscoOps(commands.Cog):
         data_dir = cog_data_path(self)
         data_dir.mkdir(parents=True, exist_ok=True)
         self._log_path = data_dir / "discoops.log"
+
+    async def cog_unload(self):
+        """Persist the log_writes counter when the cog is unloaded."""
+        if self._log_writes is not None:
+            await self._persist_log_writes()
 
     # --------- disk logger ----------
     async def _ensure_log_writes_loaded(self):
@@ -70,8 +76,9 @@ class DiscoOps(commands.Cog):
                     if self._log_path.exists() and self._log_path.stat().st_size > MAX_LOG_BYTES:
                         self._truncate_to_max_bytes()
 
-                # Persist the updated counter
-                await self._persist_log_writes()
+                # Persist counter periodically to reduce I/O overhead
+                if self._log_writes % PERSIST_COUNTER_EVERY == 0:
+                    await self._persist_log_writes()
         except (IOError, OSError):
             # File I/O errors - don't disrupt bot flow
             pass
