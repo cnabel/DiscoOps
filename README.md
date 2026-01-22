@@ -66,6 +66,49 @@ This opens an interactive wizard to create rich event posts with:
 
 ## Permissions
 
+
+2. Install the cog:
+```text
+[p]cog install DiscoOps discoops
+```
+
+3. Load the cog:
+```text
+[p]load discoops
+```
+
+## QuickStart
+
+Replace `[p]` with your bot's prefix.
+
+Base command: `[p]do` (alias: `[p]discoops`).
+
+Members:
+```text
+[p]do members new 7 days
+[p]do members role @Moderator
+```
+
+Scheduled Events:
+```text
+[p]do event list
+[p]do event "Game Night"
+```
+
+Optional: event attendee roles
+```text
+[p]do event role create "Game Night"
+[p]do event role sync "Game Night"
+[p]do event role delete "Game Night"
+```
+
+Ping the event role (as implemented: must be a trailing literal ` --ping` suffix):
+```text
+[p]do event role sync "Game Night" --ping
+```
+
+## Permissions
+
 User (running commands):
 - Manage Server (Manage Guild). All DiscoOps commands require this and are guild-only.
 

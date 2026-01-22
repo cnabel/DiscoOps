@@ -25,7 +25,6 @@ Events (Discord Scheduled Events):
 - `[p]do event list` (aliases: `ls`)
 - `[p]do event "Event Name"` (event summary + interested members)
 - `[p]do event members "Event Name"` (deprecated; use `[p]do event "Event Name"`)
-- `[p]do event create` (detailed event wizard)
 
 Event attendee roles:
 - `[p]do event role <create|sync|delete> "Event Name" [--ping]`
