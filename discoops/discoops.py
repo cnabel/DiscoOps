@@ -25,7 +25,8 @@ PERSIST_COUNTER_EVERY = 10 # persist log_writes counter every N writes to reduce
 class RoleDraft:
     """A role option for an event (e.g., Tank, Healer, DPS)."""
     role_id: str
-    label: str
+    division: str = ""
+    role_name: str = ""
     capacity: Optional[int] = None
     emoji: Optional[str] = None
     description: Optional[str] = None
@@ -61,6 +62,7 @@ class EventDraft:
     # Wizard UX helpers (not persisted)
     wizard_updates_message_id: Optional[int] = None
     wizard_updates: List[str] = field(default_factory=list)
+    wizard_temp_message_ids: List[int] = field(default_factory=list)
 
 
 class DiscoOps(commands.Cog):
@@ -72,6 +74,7 @@ class DiscoOps(commands.Cog):
         default_guild = {
             "event_roles": {},  # Maps scheduled_event_id(str) -> role_id
             "event_posts": {},  # Maps wizard_event_id(str) -> published post data + signups
+            "wizard_divisions": ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"],
         }
         self.config.register_guild(**default_guild)
         # Global config for persistence across restarts
@@ -391,14 +394,29 @@ class DiscoOps(commands.Cog):
 
             msg = await ch.send(content, allowed_mentions=discord.AllowedMentions.none())
             draft.wizard_updates_message_id = msg.id
+            if msg.id not in draft.wizard_temp_message_ids:
+                draft.wizard_temp_message_ids.append(msg.id)
         except Exception:
             pass
+
+    @staticmethod
+    def _role_display_name(r: RoleDraft) -> str:
+        div = (r.division or "").strip()
+        rn = (r.role_name or "").strip()
+        if div and rn:
+            return f"{div} — {rn}"
+        if rn:
+            return rn
+        if div:
+            return div
+        return "Role"
 
     @staticmethod
     def _role_to_dict(r: RoleDraft) -> dict:
         return {
             "role_id": r.role_id,
-            "label": r.label,
+            "division": r.division,
+            "role_name": r.role_name,
             "capacity": r.capacity,
             "emoji": r.emoji,
             "description": r.description,
@@ -406,9 +424,16 @@ class DiscoOps(commands.Cog):
 
     @staticmethod
     def _role_from_dict(d: dict) -> RoleDraft:
+        # Back-compat: older stored roles used "label".
+        div = d.get("division", None)
+        rn = d.get("role_name", None)
+        if div is None and rn is None:
+            rn = str(d.get("label") or "")
+            div = ""
         return RoleDraft(
             role_id=str(d.get("role_id") or ""),
-            label=str(d.get("label") or ""),
+            division=str(div or ""),
+            role_name=str(rn or ""),
             capacity=d.get("capacity", None),
             emoji=d.get("emoji", None),
             description=d.get("description", None),
@@ -460,7 +485,8 @@ class DiscoOps(commands.Cog):
             else:
                 open_slots = max(0, int(cap) - occupied)
                 slot_str = f"{occupied}/{cap_str} ({open_slots} open)"
-            label = f"{rd_obj.emoji} {rd_obj.label}" if rd_obj.emoji else rd_obj.label
+            base = self._role_display_name(rd_obj)
+            label = f"{rd_obj.emoji} {base}" if rd_obj.emoji else base
             extra = f" — {rd_obj.description}" if rd_obj.description else ""
             role_lines.append(f"- {label} — {slot_str}{extra}")
 
@@ -555,7 +581,8 @@ class DiscoOps(commands.Cog):
             role_lines = []
             for r in draft.roles.values():
                 cap = "∞" if r.capacity is None else r.capacity
-                label = f"{r.emoji} {r.label}" if r.emoji else r.label
+                base = self._role_display_name(r)
+                label = f"{r.emoji} {base}" if r.emoji else base
                 extra = f" — {r.description}" if r.description else ""
                 role_lines.append(f"• {label} ({cap}){extra}")
             e.add_field(name="Roles", value="\n".join(role_lines)[:1024], inline=False)
@@ -832,6 +859,28 @@ class DiscoOps(commands.Cog):
 
         draft.calendar_mode = "LINK_EXISTING"
         draft.linked_scheduled_event_id = ev.id
+
+        # Prevent multiple wizard posts for the same scheduled event.
+        try:
+            existing = await self._find_existing_post_for_scheduled(interaction.guild, ev.id)
+            if existing:
+                ch_id = existing.get("channel_id")
+                msg_id = existing.get("message_id")
+                jump = ""
+                try:
+                    if ch_id and msg_id:
+                        jump = f"https://discord.com/channels/{interaction.guild.id}/{int(ch_id)}/{int(msg_id)}"
+                except Exception:
+                    jump = ""
+                msg = "A wizard post already exists for that scheduled event. Delete it first if you want to recreate it."
+                if jump:
+                    msg += f"\n\nExisting post: {jump}"
+                await self._send_ephemeral(interaction, msg)
+                await self._cleanup_wizard_messages(interaction.guild, draft)
+                self._drafts.pop(draft.creator_id, None)
+                return
+        except Exception:
+            pass
         draft.title = ev.name or draft.title or "Untitled Event"
         draft.starts_at = ev.start_time
         draft.ends_at = ev.end_time
@@ -915,7 +964,7 @@ class DiscoOps(commands.Cog):
             async def add_role(self, inter: discord.Interaction, button: discord.ui.Button):
                 if inter.user.id != draft.creator_id:
                     return await inter.response.send_message("Only the organizer can edit roles.", ephemeral=True)
-                await outer._open_add_role_modal(inter, draft)
+                await outer._open_add_role_division_picker(inter, draft)
 
             @discord.ui.button(label="Done", style=discord.ButtonStyle.success)
             async def done(self, inter: discord.Interaction, button: discord.ui.Button):
@@ -925,21 +974,71 @@ class DiscoOps(commands.Cog):
 
         # Show a compact summary as ephemeral message
         summary = "No roles yet." if not draft.roles else "\n".join(
-            f"• {(r.emoji + ' ') if r.emoji else ''}{r.label} ({'∞' if r.capacity is None else r.capacity})" for r in draft.roles.values()
+            f"• {(r.emoji + ' ') if r.emoji else ''}{outer._role_display_name(r)} ({'∞' if r.capacity is None else r.capacity})"
+            for r in draft.roles.values()
         )
         await self._send_ephemeral(interaction, f"**Roles so far:**\n{summary}", view=RolesView())
 
-    async def _open_add_role_modal(self, interaction: discord.Interaction, draft: EventDraft):
-        """Open a modal to add a new role option."""
-        outer = self
+    async def _open_add_role_division_picker(self, interaction: discord.Interaction, draft: EventDraft):
+        """Step 1: pick a division for the new role."""
+        if len(draft.roles) >= 24:
+            return await self._send_ephemeral(interaction, "You can only have up to **24** roles (Discord menu limit).")
 
-        class AddRoleModal(discord.ui.Modal, title="Add Role Option"):
-            label = discord.ui.TextInput(label="Label", required=True, max_length=50)
+        outer = self
+        divisions = []
+        try:
+            divisions = await self.config.guild(interaction.guild).wizard_divisions()
+        except Exception:
+            divisions = ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"]
+        divisions = [d.strip() for d in (divisions or []) if str(d).strip()]
+        if not divisions:
+            divisions = ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"]
+
+        # Discord select option cap
+        divisions = divisions[:25]
+
+        opts = [discord.SelectOption(label=d[:100], value=d) for d in divisions]
+
+        class DivisionPickView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=120)
+
+            @discord.ui.select(placeholder="Pick a division…", options=opts, min_values=1, max_values=1)
+            async def pick(self, inter: discord.Interaction, select: discord.ui.Select):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can add roles.", ephemeral=True)
+                division = select.values[0]
+                await inter.response.send_modal(outer._create_add_role_modal(draft, division=division))
+
+        await self._send_ephemeral(interaction, "Select the division for the new role:", view=DivisionPickView())
+
+    def _create_add_role_modal(self, draft: EventDraft, *, division: str) -> discord.ui.Modal:
+        """Step 2: enter role name + capacity."""
+        outer = self
+        division = (division or "").strip()
+
+        class AddRoleModal(discord.ui.Modal, title="Add Division Role"):
+            role_name = discord.ui.TextInput(label=f"Role in {division}", required=True, max_length=50)
             capacity = discord.ui.TextInput(label="Capacity (blank = unlimited)", required=False, max_length=6)
-            desc = discord.ui.TextInput(label="Description (optional)", required=False, max_length=100)
 
             async def on_submit(self, inter: discord.Interaction):
-                rid = f"r{len(draft.roles)+1}"
+                if len(draft.roles) >= 24:
+                    return await inter.response.send_message("Max roles reached (24).", ephemeral=True)
+
+                rn = (self.role_name.value or "").strip()
+                if not rn:
+                    return await inter.response.send_message("Role name is required.", ephemeral=True)
+
+                # Validate duplicate (division, role_name)
+                dn = outer._norm_text(division)
+                rnn = outer._norm_text(rn)
+                for existing in draft.roles.values():
+                    if outer._norm_text(existing.division) == dn and outer._norm_text(existing.role_name) == rnn:
+                        return await inter.response.send_message(
+                            f"That role already exists: **{division} — {rn}**",
+                            ephemeral=True,
+                        )
+
                 cap_raw = (self.capacity.value or "").strip()
                 cap_val: Optional[int] = None
                 if cap_raw:
@@ -947,19 +1046,27 @@ class DiscoOps(commands.Cog):
                         cap_val = max(0, int(cap_raw))
                     except ValueError:
                         return await inter.response.send_message("Capacity must be a number.", ephemeral=True)
+
+                rid = f"r{len(draft.roles) + 1}"
                 rd = RoleDraft(
                     role_id=rid,
-                    label=(self.label.value or "").strip(),
+                    division=division,
+                    role_name=rn,
                     capacity=cap_val,
-                    description=(self.desc.value or "").strip() or None,
                 )
                 draft.roles[rid] = rd
+
+                disp = outer._role_display_name(rd)
                 await inter.response.send_message(
-                    f"Added role **{rd.label}**. Next: react to the emoji prompt in the channel (or ignore to skip).",
+                    f"Added role **{disp}**. Next: react to the emoji prompt in the channel (or ignore to skip).",
                     ephemeral=True,
                 )
                 try:
-                    await outer._wizard_note_change(inter.guild, draft, f"Role added: {rd.label} ({'∞' if rd.capacity is None else rd.capacity})")
+                    await outer._wizard_note_change(
+                        inter.guild,
+                        draft,
+                        f"Role added: {disp} ({'∞' if rd.capacity is None else rd.capacity})",
+                    )
                 except Exception:
                     pass
 
@@ -968,9 +1075,14 @@ class DiscoOps(commands.Cog):
                     ch = inter.guild.get_channel(draft.draft_channel_id) if draft.draft_channel_id else inter.channel
                     if ch:
                         prompt = await ch.send(
-                            f"Pick an emoji for **{rd.label}** by reacting to this message (timeout: 60s).",
+                            f"Pick an emoji for **{disp}** by reacting to this message (timeout: 60s).",
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
+                        try:
+                            if prompt.id not in draft.wizard_temp_message_ids:
+                                draft.wizard_temp_message_ids.append(prompt.id)
+                        except Exception:
+                            pass
 
                         def check(reaction: discord.Reaction, user: discord.User):
                             try:
@@ -979,12 +1091,12 @@ class DiscoOps(commands.Cog):
                                 return False
 
                         try:
-                            reaction, user = await outer.bot.wait_for("reaction_add", timeout=60.0, check=check)
+                            reaction, _user = await outer.bot.wait_for("reaction_add", timeout=60.0, check=check)
                             emoji_str = str(reaction.emoji) if reaction and reaction.emoji else None
                             if emoji_str:
                                 rd.emoji = emoji_str
                                 draft.roles[rid] = rd
-                                await outer._wizard_note_change(inter.guild, draft, f"Role emoji set: {rd.label} = {emoji_str}")
+                                await outer._wizard_note_change(inter.guild, draft, f"Role emoji set: {disp} = {emoji_str}")
                         except asyncio.TimeoutError:
                             pass
                         except Exception:
@@ -998,7 +1110,7 @@ class DiscoOps(commands.Cog):
 
                 await outer._refresh_preview(inter.guild, draft)
 
-        await interaction.response.send_modal(AddRoleModal())
+        return AddRoleModal()
 
     async def _open_options_view(self, interaction: discord.Interaction, draft: EventDraft):
         """Open the options configuration view."""
@@ -1080,57 +1192,262 @@ class DiscoOps(commands.Cog):
         await self._send_ephemeral(interaction, "Options:", view=OptionsView())
 
     async def _publish_from_draft(self, interaction: discord.Interaction, draft: EventDraft):
-        """Publish the event from the draft."""
-        await self._defer_ephemeral(interaction)
-        async with self._draft_lock(draft.event_id):
-            # Create the canonical event message
-            detailed_msg = await self._post_canonical_event(interaction.guild, draft, channel_hint=draft.draft_channel_id)
+        """Open publish destination picker (category -> channel)."""
+        if interaction.user.id != draft.creator_id:
+            return await self._send_ephemeral(interaction, "Only the organizer can publish this draft.")
+        await self._open_publish_destination(interaction, draft)
 
-            # Optionally: sync key fields back to calendar if linked & toggle is on
+    async def _cleanup_wizard_messages(self, guild: discord.Guild, draft: EventDraft):
+        """Best-effort cleanup of wizard messages in the draft channel."""
+        try:
+            if not draft.draft_channel_id:
+                return
+            ch = guild.get_channel(draft.draft_channel_id)
+            if not ch:
+                return
+
+            ids = set()
+            if draft.preview_message_id:
+                ids.add(int(draft.preview_message_id))
+            if draft.wizard_updates_message_id:
+                ids.add(int(draft.wizard_updates_message_id))
+            for mid in (draft.wizard_temp_message_ids or []):
+                try:
+                    ids.add(int(mid))
+                except Exception:
+                    pass
+
+            for mid in ids:
+                try:
+                    msg = await ch.fetch_message(mid)
+                    await msg.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def _find_existing_post_for_scheduled(self, guild: discord.Guild, scheduled_event_id: int) -> Optional[dict]:
+        try:
+            posts = await self.config.guild(guild).event_posts()
+            for _eid, post in (posts or {}).items():
+                try:
+                    if int(post.get("linked_scheduled_event_id") or 0) == int(scheduled_event_id):
+                        return post
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    async def _open_publish_destination(self, interaction: discord.Interaction, draft: EventDraft):
+        """Ask organizer to select category + channel for publishing."""
+        outer = self
+        guild = interaction.guild
+
+        # Build eligible channels
+        eligible = []
+        try:
+            me = guild.me
+        except Exception:
+            me = None
+        for ch in getattr(guild, "text_channels", []) or []:
+            try:
+                perms = ch.permissions_for(me) if me else None
+                if not perms:
+                    continue
+                if not (perms.view_channel and perms.send_messages and perms.read_message_history):
+                    continue
+                eligible.append(ch)
+            except Exception:
+                continue
+
+        if not eligible:
+            return await self._send_ephemeral(interaction, "I can't find any text channels I can post and maintain (need View Channel + Send Messages + Read Message History).")
+
+        by_cat: Dict[str, List[discord.TextChannel]] = {}
+        for ch in eligible:
+            key = str(ch.category_id) if ch.category_id else "none"
+            by_cat.setdefault(key, []).append(ch)
+        for key in list(by_cat.keys()):
+            by_cat[key].sort(key=lambda c: c.position)
+
+        # Category options (max 25). If there are more, user can use Search.
+        cat_opts = []
+        # Keep server order
+        for cat in sorted(getattr(guild, "categories", []) or [], key=lambda c: c.position):
+            if str(cat.id) in by_cat:
+                cat_opts.append(discord.SelectOption(label=cat.name[:100], value=str(cat.id)))
+        if "none" in by_cat:
+            cat_opts.append(discord.SelectOption(label="No Category", value="none"))
+        cat_opts = cat_opts[:25]
+
+        class ChannelSearchModal(discord.ui.Modal):
+            query = discord.ui.TextInput(label="Channel name contains", required=True, max_length=50)
+
+            def __init__(self, *, source_message_id: int):
+                super().__init__(title="Search Channel")
+                self.source_message_id = source_message_id
+
+            async def on_submit(self, inter: discord.Interaction):
+                q = (self.query.value or "").strip().casefold()
+                matches = [c for c in eligible if q and q in (c.name or "").casefold()]
+                matches.sort(key=lambda c: (c.category.position if c.category else 9999, c.position))
+                view = PublishDestinationView()
+                view.set_channel_options(matches[:25])
+                try:
+                    await inter.response.defer(ephemeral=True)
+                except Exception:
+                    pass
+                try:
+                    await inter.followup.edit_message(
+                        message_id=self.source_message_id,
+                        content="Pick a destination channel:",
+                        view=view,
+                    )
+                except Exception:
+                    await outer._send_ephemeral(inter, "Couldn't update the picker; try using category/channel selects instead.")
+
+        class PublishDestinationView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=300)
+                self.selected_category = None
+                self.selected_channel = None
+
+                self.category_select = discord.ui.Select(
+                    placeholder="Pick a category…",
+                    options=cat_opts,
+                    min_values=1,
+                    max_values=1,
+                )
+                self.category_select.callback = self.on_pick_category
+                self.add_item(self.category_select)
+
+                self.channel_select = discord.ui.Select(
+                    placeholder="Pick a channel…",
+                    options=[],
+                    min_values=1,
+                    max_values=1,
+                    disabled=True,
+                )
+                self.channel_select.callback = self.on_pick_channel
+                self.add_item(self.channel_select)
+
+                self.publish_btn = discord.ui.Button(label="Publish", style=discord.ButtonStyle.success, disabled=True)
+                self.publish_btn.callback = self.on_publish
+                self.add_item(self.publish_btn)
+
+                self.search_btn = discord.ui.Button(label="Search Channel", style=discord.ButtonStyle.secondary)
+                self.search_btn.callback = self.on_search
+                self.add_item(self.search_btn)
+
+                self.cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger)
+                self.cancel_btn.callback = self.on_cancel
+                self.add_item(self.cancel_btn)
+
+            def set_channel_options(self, channels: List[discord.TextChannel]):
+                opts = []
+                for c in (channels or [])[:25]:
+                    label = ("#" + c.name)[:100]
+                    desc = (c.category.name if c.category else "No Category")[:100]
+                    opts.append(discord.SelectOption(label=label, value=str(c.id), description=desc))
+                self.channel_select.options = opts
+                self.channel_select.disabled = not bool(opts)
+                self.publish_btn.disabled = True
+
+            async def _check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != draft.creator_id:
+                    await inter.response.send_message("Only the organizer can publish.", ephemeral=True)
+                    return False
+                return True
+
+            async def on_pick_category(self, inter: discord.Interaction):
+                if not await self._check(inter):
+                    return
+                self.selected_category = self.category_select.values[0]
+                chans = by_cat.get(str(self.selected_category), [])
+                self.set_channel_options(chans)
+                await inter.response.edit_message(content="Pick a destination channel:", view=self)
+
+            async def on_pick_channel(self, inter: discord.Interaction):
+                if not await self._check(inter):
+                    return
+                self.selected_channel = self.channel_select.values[0]
+                self.publish_btn.disabled = False
+                await inter.response.edit_message(view=self)
+
+            async def on_search(self, inter: discord.Interaction):
+                if not await self._check(inter):
+                    return
+                src_id = getattr(getattr(inter, "message", None), "id", None)
+                if not src_id:
+                    return await inter.response.send_message("Can't open search here; try picking a category.", ephemeral=True)
+                await inter.response.send_modal(ChannelSearchModal(source_message_id=int(src_id)))
+
+            async def on_cancel(self, inter: discord.Interaction):
+                if not await self._check(inter):
+                    return
+                await inter.response.edit_message(content="Publish canceled.", view=None)
+
+            async def on_publish(self, inter: discord.Interaction):
+                if not await self._check(inter):
+                    return
+                if not self.selected_channel:
+                    return await inter.response.send_message("Pick a channel first.", ephemeral=True)
+                await inter.response.defer(ephemeral=True, thinking=True)
+                await outer._publish_to_channel(inter, draft, channel_id=int(self.selected_channel))
+
+        await self._send_ephemeral(interaction, "Pick a destination category/channel:", view=PublishDestinationView())
+
+    async def _publish_to_channel(self, interaction: discord.Interaction, draft: EventDraft, *, channel_id: int):
+        guild = interaction.guild
+
+        # Prevent multiple wizard posts for the same scheduled event.
+        if draft.linked_scheduled_event_id:
+            existing = await self._find_existing_post_for_scheduled(guild, draft.linked_scheduled_event_id)
+            if existing:
+                ch_id = existing.get("channel_id")
+                msg_id = existing.get("message_id")
+                jump = ""
+                try:
+                    if ch_id and msg_id:
+                        jump = f"https://discord.com/channels/{guild.id}/{int(ch_id)}/{int(msg_id)}"
+                except Exception:
+                    jump = ""
+                msg = "An event post already exists for that scheduled event."
+                if jump:
+                    msg += f"\n\nExisting post: {jump}"
+                return await self._send_ephemeral(interaction, msg)
+
+        async with self._draft_lock(draft.event_id):
+            detailed_msg = await self._post_canonical_event(guild, draft, channel_hint=channel_id)
+
+            # Optional: sync key fields back to calendar if linked & toggle is on
             if draft.sync_back_to_calendar and draft.calendar_mode == "LINK_EXISTING" and draft.linked_scheduled_event_id:
                 try:
-                    cal = await self._resolve_scheduled_event(interaction.guild, draft.linked_scheduled_event_id)
+                    cal = await self._resolve_scheduled_event(guild, draft.linked_scheduled_event_id)
                     if cal:
                         await cal.edit(
                             name=draft.title or cal.name,
                             start_time=draft.starts_at or cal.start_time,
                             end_time=draft.ends_at or cal.end_time,
-                            description=(draft.description_md[:1000] or None)  # calendar limits
+                            description=(draft.description_md[:1000] or None),
                         )
                 except Exception:
                     pass
 
-            # Mark the preview as published (or remove it)
-            try:
-                if draft.preview_message_id and draft.draft_channel_id:
-                    ch = interaction.guild.get_channel(draft.draft_channel_id)
-                    if ch:
-                        msg = await ch.fetch_message(draft.preview_message_id)
-                        await msg.edit(content="✅ Published.", embed=None, view=None)
-            except Exception:
-                pass
+            # Cleanup wizard messages
+            await self._cleanup_wizard_messages(guild, draft)
 
             # Cleanup transient draft
             self._drafts.pop(draft.creator_id, None)
             draft.status = "PUBLISHED"
 
-            try:
-                await self._send_ephemeral(interaction, f"Event published. Jump: {detailed_msg.jump_url}")
-            except Exception:
-                pass
-            await self.log_info(f"{interaction.user} published event {draft.event_id} in guild {interaction.guild.id}")
+            await self._send_ephemeral(interaction, f"Event published. Jump: {detailed_msg.jump_url}")
+            await self.log_info(f"{interaction.user} published event {draft.event_id} in guild {guild.id}")
 
     async def _cancel_draft(self, interaction: discord.Interaction, draft: EventDraft):
         """Cancel and delete the draft."""
-        # delete preview message if exists
-        try:
-            if draft.preview_message_id and draft.draft_channel_id:
-                ch = interaction.guild.get_channel(draft.draft_channel_id)
-                if ch:
-                    msg = await ch.fetch_message(draft.preview_message_id)
-                    await msg.delete()
-        except Exception:
-            pass
+        await self._cleanup_wizard_messages(interaction.guild, draft)
         self._drafts.pop(draft.creator_id, None)
         await interaction.response.send_message("Draft canceled and preview removed.", ephemeral=True)
         await self.log_info(f"{interaction.user} canceled draft {draft.event_id} in guild {interaction.guild.id}")
@@ -1165,6 +1482,7 @@ class DiscoOps(commands.Cog):
 
         # Long description as follow-ups (no buttons)
         desc = (draft.description_md or "").strip()
+        detail_ids: List[int] = []
         if desc:
             # Keep it markdown, but split for safety
             chunks, cur = [], ""
@@ -1180,10 +1498,23 @@ class DiscoOps(commands.Cog):
                 chunks.append(cur)
             for i, chnk in enumerate(chunks[:5], start=1):
                 header = f"## Details" if i == 1 else "## Details (continued)"
-                await channel.send(
+                dmsg = await channel.send(
                     f"{header}\n{chnk}"[:MAX_MSG],
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                try:
+                    detail_ids.append(dmsg.id)
+                except Exception:
+                    pass
+
+        if detail_ids:
+            try:
+                async with self.config.guild(guild).event_posts() as posts:
+                    post2 = posts.get(str(draft.event_id)) or {}
+                    post2["details_message_ids"] = detail_ids
+                    posts[str(draft.event_id)] = post2
+            except Exception:
+                pass
 
         # Create a discussion thread from the message if configured
         if draft.discussion_mode == "THREAD":
@@ -1289,19 +1620,26 @@ class DiscoOps(commands.Cog):
         if not roles:
             return await self._send_ephemeral(interaction, "No roles are configured for this event.")
 
+        # Select menus only support 25 options; reserve one for withdraw.
+        if len(roles) > 24:
+            return await self._send_ephemeral(
+                interaction,
+                "This event has too many roles to show in the signup menu (max: 24). Ask an organizer to reduce the role list.",
+            )
+
         outer = self
 
         # Build options
-        options = [
-            discord.SelectOption(label="Withdraw / No role", value="", description="Remove your signup")
-        ]
+        withdraw_value = "__withdraw__"
+        options = [discord.SelectOption(label="Withdraw / No role", value=withdraw_value, description="Remove your signup")]
         for rid, rd in roles.items():
             try:
                 r = self._role_from_dict(rd)
             except Exception:
                 continue
             cap = "∞" if r.capacity is None else str(r.capacity)
-            label = f"{r.emoji} {r.label}" if r.emoji else r.label
+            base = self._role_display_name(r)
+            label = f"{r.emoji} {base}" if r.emoji else base
             desc = f"Cap: {cap}" + (f" • {r.description}" if r.description else "")
             options.append(discord.SelectOption(label=label[:100], value=str(rid), description=desc[:100]))
 
@@ -1313,7 +1651,7 @@ class DiscoOps(commands.Cog):
             async def select_role(self, inter: discord.Interaction, select: discord.ui.Select):
                 if inter.user.id != interaction.user.id:
                     return await inter.response.send_message("This menu is only for you.", ephemeral=True)
-                chosen = select.values[0]  # may be ""
+                chosen = select.values[0]
                 await outer._apply_signup_choice(inter, event_id=str(event_id), role_id=str(chosen))
                 try:
                     self.stop()
@@ -1335,8 +1673,10 @@ class DiscoOps(commands.Cog):
 
             prev = str(signups.get(uid_str) or "")
 
+            is_withdraw = (role_id or "") == "__withdraw__"
+
             # Capacity enforcement (only if changing into a role)
-            if role_id:
+            if role_id and not is_withdraw:
                 rd = roles.get(str(role_id))
                 if not rd:
                     return await interaction.response.send_message("That role is no longer available.", ephemeral=True)
@@ -1354,7 +1694,7 @@ class DiscoOps(commands.Cog):
                         )
 
             # Apply
-            if not role_id:
+            if is_withdraw or not role_id:
                 if uid_str in signups:
                     del signups[uid_str]
                 post["signups"] = signups
@@ -1367,7 +1707,7 @@ class DiscoOps(commands.Cog):
 
                 rd = roles.get(str(role_id)) or {}
                 r = self._role_from_dict(rd)
-                await interaction.response.send_message(f"Signed you up as **{r.label}**.", ephemeral=True)
+                await interaction.response.send_message(f"Signed you up as **{self._role_display_name(r)}**.", ephemeral=True)
 
         await self._update_published_post_message(guild, event_id)
 
@@ -1569,6 +1909,193 @@ class DiscoOps(commands.Cog):
         """
         await self.log_info(f"{ctx.author} started event wizard in guild {ctx.guild.id}")
         await self._open_scheduled_event_picker(ctx)
+
+    @event_group.group(name="wizard", invoke_without_command=True)
+    async def event_wizard_group(self, ctx: commands.Context):
+        """Manage published Event Wizard posts."""
+        await ctx.send_help(ctx.command)
+
+    @event_wizard_group.command(name="list")
+    async def event_wizard_list(self, ctx: commands.Context):
+        """List published Event Wizard posts tracked in config."""
+        posts = await self.config.guild(ctx.guild).event_posts()
+        posts = posts or {}
+        header = f"# Wizard Events\n**Tracked:** {len(posts)}"
+        sections = []
+        if not posts:
+            sections.append("## Events\n> None")
+        else:
+            for event_id, post in posts.items():
+                title = (post.get("title") or "Untitled").strip()
+                ch_id = post.get("channel_id")
+                msg_id = post.get("message_id")
+                linked = post.get("linked_scheduled_event_id")
+                interested = len(post.get("interested") or [])
+                signups = len(post.get("signups") or {})
+                jump = ""
+                try:
+                    if ch_id and msg_id:
+                        jump = f"https://discord.com/channels/{ctx.guild.id}/{int(ch_id)}/{int(msg_id)}"
+                except Exception:
+                    jump = ""
+
+                ch_mention = "(missing channel)"
+                try:
+                    ch = ctx.guild.get_channel(int(ch_id)) if ch_id else None
+                    if ch:
+                        ch_mention = ch.mention
+                except Exception:
+                    pass
+
+                sec = (
+                    f"## {title}\n"
+                    f"> **Wizard ID**: `{event_id}`\n"
+                    f"> **Channel**: {ch_mention}\n"
+                    + (f"> **Jump**: {jump}\n" if jump else "")
+                    + (f"> **Linked Scheduled Event ID**: `{linked}`\n" if linked else "")
+                    + f"> **Interested**: {interested}  •  **Signups**: {signups}"
+                )
+                sections.append(sec)
+        await self._send_paginated(ctx, sections, header=header)
+
+    @event_wizard_group.command(name="delete")
+    async def event_wizard_delete(self, ctx: commands.Context, *, identifier: str):
+        """Delete a published wizard event (by wizard ID or message link/id)."""
+        identifier = (identifier or "").strip()
+        if not identifier:
+            return await ctx.send("Provide a wizard event id or message link.", allowed_mentions=discord.AllowedMentions.none())
+
+        posts = await self.config.guild(ctx.guild).event_posts()
+        posts = posts or {}
+
+        target_event_id = None
+
+        # Parse message link
+        if "/channels/" in identifier:
+            try:
+                parts = identifier.replace("<", "").replace(">", "").split("/")
+                msg_id = None
+                for tok in reversed(parts):
+                    if tok.isdigit():
+                        msg_id = int(tok)
+                        break
+                if msg_id:
+                    for eid, post in posts.items():
+                        if int(post.get("message_id") or 0) == msg_id:
+                            target_event_id = eid
+                            break
+            except Exception:
+                pass
+
+        # Parse bare message id
+        if target_event_id is None and identifier.isdigit():
+            mid = int(identifier)
+            for eid, post in posts.items():
+                try:
+                    if int(post.get("message_id") or 0) == mid:
+                        target_event_id = eid
+                        break
+                except Exception:
+                    continue
+
+        # Fallback: treat as wizard id
+        if target_event_id is None:
+            if identifier in posts:
+                target_event_id = identifier
+
+        if not target_event_id:
+            return await ctx.send("Wizard event not found.", allowed_mentions=discord.AllowedMentions.none())
+
+        post = posts.get(str(target_event_id))
+        if not post:
+            return await ctx.send("Wizard event not found.", allowed_mentions=discord.AllowedMentions.none())
+
+        deleted = 0
+        ch_id = post.get("channel_id")
+        msg_id = post.get("message_id")
+        detail_ids = post.get("details_message_ids") or []
+
+        try:
+            ch = ctx.guild.get_channel(int(ch_id)) if ch_id else None
+        except Exception:
+            ch = None
+
+        if ch:
+            # Delete main message
+            try:
+                if msg_id:
+                    m = await ch.fetch_message(int(msg_id))
+                    await m.delete()
+                    deleted += 1
+            except Exception:
+                pass
+            # Delete detail messages
+            for did in detail_ids:
+                try:
+                    m2 = await ch.fetch_message(int(did))
+                    await m2.delete()
+                    deleted += 1
+                except Exception:
+                    continue
+
+        async with self.config.guild(ctx.guild).event_posts() as posts_mut:
+            if str(target_event_id) in posts_mut:
+                del posts_mut[str(target_event_id)]
+
+        await ctx.send(
+            f"Deleted wizard event `{target_event_id}`. Messages removed: {deleted}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @event_wizard_group.group(name="divisions", invoke_without_command=True)
+    async def event_wizard_divisions(self, ctx: commands.Context):
+        """Manage the division list used by the Roles Builder."""
+        await ctx.send_help(ctx.command)
+
+    @event_wizard_divisions.command(name="list")
+    async def event_wizard_divisions_list(self, ctx: commands.Context):
+        vals = await self.config.guild(ctx.guild).wizard_divisions()
+        vals = [str(v).strip() for v in (vals or []) if str(v).strip()]
+        header = "# Wizard Divisions"
+        if not vals:
+            return await self._send_paginated(ctx, ["## Divisions\n> None"], header=header)
+        lines = "\n".join(f"{i}. {v}" for i, v in enumerate(vals, start=1))
+        await self._send_paginated(ctx, [f"## Divisions\n{lines}"], header=header)
+
+    @event_wizard_divisions.command(name="add")
+    async def event_wizard_divisions_add(self, ctx: commands.Context, *, name: str):
+        name = (name or "").strip()
+        if not name:
+            return await ctx.send("Division name required.", allowed_mentions=discord.AllowedMentions.none())
+        async with self.config.guild(ctx.guild).wizard_divisions() as vals:
+            norm = self._norm_text(name)
+            if any(self._norm_text(v) == norm for v in (vals or [])):
+                return await ctx.send("That division already exists.", allowed_mentions=discord.AllowedMentions.none())
+            vals.append(name)
+        await ctx.send(f"Added division: **{name}**", allowed_mentions=discord.AllowedMentions.none())
+
+    @event_wizard_divisions.command(name="remove", aliases=["rm", "del"])
+    async def event_wizard_divisions_remove(self, ctx: commands.Context, *, name: str):
+        name = (name or "").strip()
+        if not name:
+            return await ctx.send("Division name required.", allowed_mentions=discord.AllowedMentions.none())
+        removed = False
+        async with self.config.guild(ctx.guild).wizard_divisions() as vals:
+            norm = self._norm_text(name)
+            new_vals = [v for v in (vals or []) if self._norm_text(v) != norm]
+            removed = len(new_vals) != len(vals or [])
+            vals.clear()
+            vals.extend(new_vals)
+        if removed:
+            await ctx.send(f"Removed division: **{name}**", allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await ctx.send("Division not found.", allowed_mentions=discord.AllowedMentions.none())
+
+    @event_wizard_divisions.command(name="reset")
+    async def event_wizard_divisions_reset(self, ctx: commands.Context):
+        defaults = ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"]
+        await self.config.guild(ctx.guild).wizard_divisions.set(defaults)
+        await ctx.send("Wizard divisions reset to defaults.", allowed_mentions=discord.AllowedMentions.none())
 
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
