@@ -263,13 +263,30 @@ class DiscoOps(commands.Cog):
         return None
 
     @staticmethod
-    async def _send_paginated(ctx, chunks, header=None, footer=None):
+    async def _send_paginated(
+        ctx,
+        chunks,
+        header=None,
+        footer=None,
+        *,
+        allowed_mentions: Optional[discord.AllowedMentions] = None,
+        ping: Optional[str] = None,
+        ping_mentions: Optional[discord.AllowedMentions] = None,
+    ):
         """
         Send plain text chunks split below Discord's limit.
         `chunks` can be a list of strings (sections).
+
+        Mentions are disabled by default to prevent mass-pings.
+        If you intentionally want a ping, pass `ping="..."` (sent as a final message).
         """
         header = header or ""
         footer = footer or ""
+        allowed_mentions = allowed_mentions or discord.AllowedMentions.none()
+        ping_mentions = ping_mentions or discord.AllowedMentions(
+            roles=True, users=False, everyone=False, replied_user=False
+        )
+
         pages = []
         current = header + ("\n\n" if header else "")
         for part in chunks:
@@ -281,7 +298,16 @@ class DiscoOps(commands.Cog):
             else:
                 current += addition
         if current.strip():
-            pages.append((current + ("\n\n" + footer if footer and len(current) + len("\n\n" + footer) <= MAX_MSG else "")).rstrip())
+            pages.append(
+                (
+                    current
+                    + (
+                        "\n\n" + footer
+                        if footer and len(current) + len("\n\n" + footer) <= MAX_MSG
+                        else ""
+                    )
+                ).rstrip()
+            )
 
         # If footer didn't fit on the last page, push separately
         if footer and (not pages or not pages[-1].endswith(footer)):
@@ -289,7 +315,10 @@ class DiscoOps(commands.Cog):
 
         for page in pages:
             if page.strip():
-                await ctx.send(page)
+                await ctx.send(page, allowed_mentions=allowed_mentions)
+
+        if ping:
+            await ctx.send(ping, allowed_mentions=ping_mentions)
 
     # --------- Detailed Events Wizard helpers ----------
 
@@ -472,7 +501,12 @@ class DiscoOps(commands.Cog):
                 await outer._open_description_modal_followup(interaction, draft)
 
         # Send the picker prompt
-        await ctx.send("Select a scheduled event to import details:", view=EventPicker(scheduled), delete_after=300)
+        await ctx.send(
+            "Select a scheduled event to import details:",
+            view=EventPicker(scheduled),
+            delete_after=300,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def _open_paste_event_modal(self, interaction: discord.Interaction, draft: EventDraft):
         """Open a modal to paste an event ID or URL."""
@@ -819,7 +853,10 @@ class DiscoOps(commands.Cog):
 
         period_l = (period or "").lower()
         if period_l not in ("days", "day", "weeks", "week", "months", "month"):
-            await ctx.send("Period must be 'days', 'weeks', or 'months'")
+            await ctx.send(
+                "Period must be 'days', 'weeks', or 'months'",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             await self.log_info("Invalid period provided to 'members new'")
             return
 
@@ -853,7 +890,8 @@ class DiscoOps(commands.Cog):
 
         if not members:
             await ctx.send(
-                "I couldn't access the member list. Ensure **Server Members Intent** is enabled and the bot has cached members."
+                "I couldn't access the member list. Ensure **Server Members Intent** is enabled and the bot has cached members.",
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             await self.log_info("members list empty or inaccessible; likely missing Server Members Intent")
             return
@@ -871,7 +909,10 @@ class DiscoOps(commands.Cog):
                     recent.append((m, ja))
         except Exception as e:
             await self.log_info(f"Error filtering recent members: {e}")
-            await ctx.send("An error occurred while reading member join dates.")
+            await ctx.send(
+                "An error occurred while reading member join dates.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
 
         recent.sort(key=lambda tup: tup[1], reverse=True)
@@ -880,7 +921,8 @@ class DiscoOps(commands.Cog):
             await ctx.send(
                 f"ℹ️ No members joined in the last {amount} {period_l}.\n\n"
                 f"**Note:** Make sure the bot has been running and has cached member data. "
-                f"Members who joined before the bot was added won't be tracked."
+                f"Members who joined before the bot was added won't be tracked.",
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             await self.log_info("No recent members found")
             return
@@ -972,7 +1014,10 @@ class DiscoOps(commands.Cog):
         """List scheduled events as normal messages (no embed), with pagination."""
         events = await self._get_scheduled_events(ctx.guild, with_counts=True)
         if not events:
-            await ctx.send("No scheduled events found in this server.")
+            await ctx.send(
+                "No scheduled events found in this server.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
 
         far_future = datetime.max.replace(tzinfo=timezone.utc)
@@ -1028,7 +1073,10 @@ class DiscoOps(commands.Cog):
     @event_group.command(name="members")  # deprecated path, kept for compatibility
     async def event_members_legacy(self, ctx, *, event_name: str):
         """[Deprecated] Use: `[p]do event "Name"` instead."""
-        await ctx.send("`members` is deprecated. Use: `[p]do event \"Event Name\"`.\nShowing the info below:")
+        await ctx.send(
+            "`members` is deprecated. Use: `[p]do event \"Event Name\"`.\nShowing the info below:",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         await self._event_info_with_members(ctx, event_name)
 
     async def _event_info_with_members(self, ctx, event_name: str):
@@ -1039,7 +1087,8 @@ class DiscoOps(commands.Cog):
             await ctx.send(
                 f"❌ **Event Not Found:** '{event_name}'\n\n"
                 f"**Tip:** Use `[p]do event list` to see all scheduled events, then copy the exact event name.\n"
-                f"**Note:** Event names are case-insensitive and support partial matches."
+                f"**Note:** Event names are case-insensitive and support partial matches.",
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             await self.log_info(f"event info: not found for query={event_name!r}")
             return
@@ -1052,7 +1101,10 @@ class DiscoOps(commands.Cog):
                 if member:
                     interested_users.append(member)
         except Exception as e:
-            await ctx.send(f"Error fetching interested users: {e}")
+            await ctx.send(
+                f"Error fetching interested users: {e}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             await self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
@@ -1117,11 +1169,25 @@ class DiscoOps(commands.Cog):
     async def event_role(self, ctx, action: str, *, event_name: str):
         """
         Create, sync, or delete a role for event attendees.
-        Usage: [p]do event role <create|sync|delete> <event_name>
+
+        Usage: [p]do event role <create|sync|delete> <event_name> [--ping]
+
+        Notes:
+        - Mentions are suppressed by default to prevent mass-pings.
+        - Add `--ping` to send a final message that pings the event role.
         """
+        raw_event_name = event_name or ""
+        ping = False
+        if raw_event_name.endswith(" --ping"):
+            ping = True
+            event_name = raw_event_name[: -len(" --ping")].rstrip()
+
         action_l = (action or "").lower()
         if action_l not in ("create", "sync", "delete"):
-            await ctx.send("Action must be 'create', 'sync', or 'delete'")
+            await ctx.send(
+                "Action must be 'create', 'sync', or 'delete'",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
 
         events = await self._get_scheduled_events(ctx.guild, with_counts=True)
@@ -1130,7 +1196,8 @@ class DiscoOps(commands.Cog):
             await ctx.send(
                 f"❌ **Event Not Found:** '{event_name}'\n\n"
                 f"**Tip:** Use `[p]do event list` to see all scheduled events, then copy the exact event name.\n"
-                f"**Note:** Event names are case-insensitive and support partial matches."
+                f"**Note:** Event names are case-insensitive and support partial matches.",
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             await self.log_info(f"event role: not found for query={event_name!r}")
             return
@@ -1143,7 +1210,10 @@ class DiscoOps(commands.Cog):
                 if member:
                     interested_users.append(member)
         except Exception as e:
-            await ctx.send(f"Error fetching interested users: {e}")
+            await ctx.send(
+                f"Error fetching interested users: {e}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             await self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
@@ -1154,7 +1224,17 @@ class DiscoOps(commands.Cog):
             if event_id_str in event_roles:
                 role = ctx.guild.get_role(event_roles[event_id_str])
                 if role:
-                    await ctx.send(f"Role already exists: {role.mention}")
+                    await ctx.send(
+                        f"Role already exists: {role.mention}",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    if ping:
+                        await ctx.send(
+                            role.mention,
+                            allowed_mentions=discord.AllowedMentions(
+                                roles=True, users=False, everyone=False, replied_user=False
+                            ),
+                        )
                     return
             try:
                 role = await ctx.guild.create_role(
@@ -1182,7 +1262,8 @@ class DiscoOps(commands.Cog):
                         f"❌ **Role Hierarchy Issue**\n"
                         f"The created role would be at or above my highest role, which prevents me from managing it.\n"
                         f"Role has been deleted.\n\n"
-                        f"**To fix:** Go to Server Settings → Roles and drag my role higher, then try again."
+                        f"**To fix:** Go to Server Settings → Roles and drag my role higher, then try again.",
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     await self.log_info(f"Role hierarchy issue: bot role {ctx.guild.me.top_role.name} below event role - deleted role")
                     return
@@ -1194,24 +1275,41 @@ class DiscoOps(commands.Cog):
                         added += 1
                     except discord.Forbidden:
                         pass
-                await ctx.send(f"Created role {role.mention} and added to {added} interested members")
+                await ctx.send(
+                    f"Created role {role.mention} and added to {added} interested members",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                if ping:
+                    await ctx.send(
+                        role.mention,
+                        allowed_mentions=discord.AllowedMentions(
+                            roles=True, users=False, everyone=False, replied_user=False
+                        ),
+                    )
                 await self.log_info(f"Created role {role.id} for event {event_id_str} in guild {ctx.guild.id}")
             except discord.Forbidden:
                 await ctx.send(
                     "❌ **Permission Error**\n"
                     "I don't have permission to create roles.\n\n"
                     "**Required Permission:** Manage Roles\n"
-                    "**How to Fix:** Go to Server Settings → Roles → [My Role] and enable 'Manage Roles'"
+                    "**How to Fix:** Go to Server Settings → Roles → [My Role] and enable 'Manage Roles'",
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
         elif action_l == "sync":
             if event_id_str not in event_roles:
-                await ctx.send(f"No role exists for event **{getattr(event, 'name', 'Event')}**. Use `create` first.")
+                await ctx.send(
+                    f"No role exists for event **{getattr(event, 'name', 'Event')}**. Use `create` first.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
             role = ctx.guild.get_role(event_roles[event_id_str])
             if not role:
-                await ctx.send(f"Role no longer exists for event **{getattr(event, 'name', 'Event')}**")
+                await ctx.send(
+                    f"Role no longer exists for event **{getattr(event, 'name', 'Event')}**",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 async with self.config.guild(ctx.guild).event_roles() as roles:
                     if event_id_str in roles:
                         del roles[event_id_str]
@@ -1241,20 +1339,39 @@ class DiscoOps(commands.Cog):
                     except discord.Forbidden:
                         pass
 
-            await ctx.send(f"Sync complete for {role.mention} — Added: {added} • Removed: {removed}")
+            await ctx.send(
+                f"Sync complete for {role.mention} — Added: {added} • Removed: {removed}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            if ping:
+                await ctx.send(
+                    role.mention,
+                    allowed_mentions=discord.AllowedMentions(
+                        roles=True, users=False, everyone=False, replied_user=False
+                    ),
+                )
             await self.log_info(f"Synced role {role.id} for event {event_id_str} in guild {ctx.guild.id}: +{added}/-{removed}")
 
         elif action_l == "delete":
             if event_id_str not in event_roles:
-                await ctx.send(f"No role exists for event **{getattr(event, 'name', 'Event')}**")
+                await ctx.send(
+                    f"No role exists for event **{getattr(event, 'name', 'Event')}**",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
             role = ctx.guild.get_role(event_roles[event_id_str])
             if role:
                 try:
                     await role.delete(reason=f"Event role deleted by {ctx.author}")
-                    await ctx.send(f"Deleted role for event **{getattr(event, 'name', 'Event')}**")
+                    await ctx.send(
+                        f"Deleted role for event **{getattr(event, 'name', 'Event')}**",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 except discord.Forbidden:
-                    await ctx.send("I don't have permission to delete this role.")
+                    await ctx.send(
+                        "I don't have permission to delete this role.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                     return
             async with self.config.guild(ctx.guild).event_roles() as roles:
                 if event_id_str in roles:
@@ -1275,7 +1392,10 @@ class DiscoOps(commands.Cog):
 
         content = await self._logs_tail(count)
         if not content:
-            await ctx.send("No logs recorded yet.")
+            await ctx.send(
+                "No logs recorded yet.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
 
         # Paginate long logs too
@@ -1320,10 +1440,16 @@ class DiscoOps(commands.Cog):
         try:
             if self._log_path.exists():
                 self._log_path.unlink()
-            await ctx.send("Logs cleared.")
+            await ctx.send(
+                "Logs cleared.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             await self.log_info(f"Logs cleared by {ctx.author}")  # creates a fresh file with one entry
         except Exception as e:
-            await ctx.send(f"Couldn't clear logs: {e}")
+            await ctx.send(
+                f"Couldn't clear logs: {e}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     @discoops.command(name="help")
     async def discoops_help(self, ctx):
@@ -1336,7 +1462,7 @@ class DiscoOps(commands.Cog):
             "## Events\n"
             "`[p]do event list` — List scheduled events (plain messages, paginated)\n"
             "`[p]do event \"Event Name\"` — Show one event (+ members)\n"
-            "`[p]do event role <create|sync|delete> \"Event Name\"` — Manage event role\n"
+            "`[p]do event role <create|sync|delete> \"Event Name\" [--ping]` — Manage event role\n"
             "`[p]do event create` — Start the detailed event wizard\n"
         )
         await self._send_paginated(ctx, [help_md])
