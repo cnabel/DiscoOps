@@ -58,6 +58,10 @@ class EventDraft:
     linked_snapshot: dict = field(default_factory=dict)
     sync_back_to_calendar: bool = True  # toggle in Options
 
+    # Wizard UX helpers (not persisted)
+    wizard_updates_message_id: Optional[int] = None
+    wizard_updates: List[str] = field(default_factory=list)
+
 
 class DiscoOps(commands.Cog):
     """Operational features to make Discord server management easier."""
@@ -65,7 +69,10 @@ class DiscoOps(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=260288776360820736)
-        default_guild = {"event_roles": {}}  # Maps event_id to role_id
+        default_guild = {
+            "event_roles": {},  # Maps scheduled_event_id(str) -> role_id
+            "event_posts": {},  # Maps wizard_event_id(str) -> published post data + signups
+        }
         self.config.register_guild(**default_guild)
         # Global config for persistence across restarts
         default_global = {"log_writes": 0}
@@ -345,6 +352,158 @@ class DiscoOps(commands.Cog):
                 await interaction.followup.send(content, view=view, ephemeral=True)
             else:
                 await interaction.response.send_message(content, view=view, ephemeral=True)
+        except Exception:
+            pass
+
+    async def _wizard_note_change(self, guild: discord.Guild, draft: EventDraft, line: str):
+        """Maintain a single editable 'wizard updates' message.
+
+        This exists to keep confirmations merged across multiple actions (roles/options)
+        even when the underlying interactions can't edit the same ephemeral response.
+        """
+        try:
+            if not line:
+                return
+            draft.wizard_updates.append(line)
+            # keep the log compact
+            draft.wizard_updates = draft.wizard_updates[-12:]
+
+            if not draft.draft_channel_id:
+                return
+            ch = guild.get_channel(draft.draft_channel_id)
+            if not ch:
+                return
+
+            body = "\n".join(f"- {ln}" for ln in draft.wizard_updates)
+            content = (
+                "# Event Wizard Updates\n"
+                "> This message updates as you make changes.\n\n"
+                f"{body}" if body else "# Event Wizard Updates\n> No changes yet."
+            )
+
+            if draft.wizard_updates_message_id:
+                try:
+                    msg = await ch.fetch_message(draft.wizard_updates_message_id)
+                    await msg.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
+                    return
+                except Exception:
+                    draft.wizard_updates_message_id = None
+
+            msg = await ch.send(content, allowed_mentions=discord.AllowedMentions.none())
+            draft.wizard_updates_message_id = msg.id
+        except Exception:
+            pass
+
+    @staticmethod
+    def _role_to_dict(r: RoleDraft) -> dict:
+        return {
+            "role_id": r.role_id,
+            "label": r.label,
+            "capacity": r.capacity,
+            "emoji": r.emoji,
+            "description": r.description,
+        }
+
+    @staticmethod
+    def _role_from_dict(d: dict) -> RoleDraft:
+        return RoleDraft(
+            role_id=str(d.get("role_id") or ""),
+            label=str(d.get("label") or ""),
+            capacity=d.get("capacity", None),
+            emoji=d.get("emoji", None),
+            description=d.get("description", None),
+        )
+
+    def _public_view_custom_id(self, action: str, event_id: str) -> str:
+        # Keep this stable; used by on_interaction router.
+        return f"evtpub:{action}:{event_id}"
+
+    def _build_public_markdown(self, post: dict) -> str:
+        title = (post.get("title") or "Untitled Event").strip()
+        starts_at = post.get("starts_at_ts")
+        ends_at = post.get("ends_at_ts")
+        comms = post.get("comms") or []
+        comms_fmt = " + ".join(
+            ["Discord" if c == "DISCORD" else "SRS" if c == "SRS" else str(c) for c in comms]
+        ) or "TBD"
+
+        when = "TBD"
+        try:
+            if starts_at:
+                when = f"<t:{int(starts_at)}:F>"
+                if ends_at:
+                    when += f" → <t:{int(ends_at)}:t>"
+        except Exception:
+            pass
+
+        # Counts
+        signups = post.get("signups") or {}
+        counts: Dict[str, int] = {}
+        for _uid, rid in signups.items():
+            rid = str(rid or "")
+            if not rid:
+                continue
+            counts[rid] = counts.get(rid, 0) + 1
+
+        roles = post.get("roles") or {}
+        role_lines = []
+        for rid, rd in roles.items():
+            try:
+                rd_obj = self._role_from_dict(rd)
+            except Exception:
+                continue
+            occupied = counts.get(str(rid), 0)
+            cap = rd_obj.capacity
+            cap_str = "∞" if cap is None else str(cap)
+            if cap is None:
+                slot_str = f"{occupied}/{cap_str}"
+            else:
+                open_slots = max(0, int(cap) - occupied)
+                slot_str = f"{occupied}/{cap_str} ({open_slots} open)"
+            label = f"{rd_obj.emoji} {rd_obj.label}" if rd_obj.emoji else rd_obj.label
+            extra = f" — {rd_obj.description}" if rd_obj.description else ""
+            role_lines.append(f"- {label} — {slot_str}{extra}")
+
+        interested = post.get("interested") or []
+        interested_count = len(interested)
+
+        header = f"# {title}"
+        top = (
+            f"**When:** {when}\n"
+            f"**Comms:** {comms_fmt}\n"
+            f"**Interested:** {interested_count}"
+        )
+        if role_lines:
+            roles_block = "\n".join(["\n## Roles"] + role_lines)
+        else:
+            roles_block = "\n## Roles\n- None"
+
+        footer = "\n\n> Use the buttons below to register interest and pick a role."
+        out = f"{header}\n{top}{roles_block}{footer}"
+
+        # Ensure we don't exceed the safe bound; description is sent separately.
+        return out[:MAX_MSG]
+
+    async def _update_published_post_message(self, guild: discord.Guild, event_id: str):
+        try:
+            posts = await self.config.guild(guild).event_posts()
+            post = posts.get(str(event_id))
+            if not post:
+                return
+            channel_id = post.get("channel_id")
+            message_id = post.get("message_id")
+            if not channel_id or not message_id:
+                return
+            ch = guild.get_channel(int(channel_id))
+            if not ch:
+                return
+            try:
+                msg = await ch.fetch_message(int(message_id))
+            except Exception:
+                return
+            content = self._build_public_markdown(post)
+            view = self._build_public_view(event_id=str(event_id), disabled=False)
+            await msg.edit(content=content, embed=None, view=view, allowed_mentions=discord.AllowedMentions.none())
         except Exception:
             pass
 
@@ -777,7 +936,6 @@ class DiscoOps(commands.Cog):
         class AddRoleModal(discord.ui.Modal, title="Add Role Option"):
             label = discord.ui.TextInput(label="Label", required=True, max_length=50)
             capacity = discord.ui.TextInput(label="Capacity (blank = unlimited)", required=False, max_length=6)
-            emoji = discord.ui.TextInput(label="Emoji (optional)", required=False, max_length=10, placeholder="e.g., 🛡️")
             desc = discord.ui.TextInput(label="Description (optional)", required=False, max_length=100)
 
             async def on_submit(self, inter: discord.Interaction):
@@ -793,11 +951,51 @@ class DiscoOps(commands.Cog):
                     role_id=rid,
                     label=(self.label.value or "").strip(),
                     capacity=cap_val,
-                    emoji=(self.emoji.value or "").strip() or None,
                     description=(self.desc.value or "").strip() or None,
                 )
                 draft.roles[rid] = rd
-                await inter.response.send_message(f"Added role **{rd.label}**.", ephemeral=True)
+                await inter.response.send_message(
+                    f"Added role **{rd.label}**. Next: react to the emoji prompt in the channel (or ignore to skip).",
+                    ephemeral=True,
+                )
+                try:
+                    await outer._wizard_note_change(inter.guild, draft, f"Role added: {rd.label} ({'∞' if rd.capacity is None else rd.capacity})")
+                except Exception:
+                    pass
+
+                # Emoji picker via reaction (native emoji picker UX)
+                try:
+                    ch = inter.guild.get_channel(draft.draft_channel_id) if draft.draft_channel_id else inter.channel
+                    if ch:
+                        prompt = await ch.send(
+                            f"Pick an emoji for **{rd.label}** by reacting to this message (timeout: 60s).",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+
+                        def check(reaction: discord.Reaction, user: discord.User):
+                            try:
+                                return user.id == draft.creator_id and reaction.message.id == prompt.id
+                            except Exception:
+                                return False
+
+                        try:
+                            reaction, user = await outer.bot.wait_for("reaction_add", timeout=60.0, check=check)
+                            emoji_str = str(reaction.emoji) if reaction and reaction.emoji else None
+                            if emoji_str:
+                                rd.emoji = emoji_str
+                                draft.roles[rid] = rd
+                                await outer._wizard_note_change(inter.guild, draft, f"Role emoji set: {rd.label} = {emoji_str}")
+                        except asyncio.TimeoutError:
+                            pass
+                        except Exception:
+                            pass
+                        try:
+                            await prompt.delete()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 await outer._refresh_preview(inter.guild, draft)
 
         await interaction.response.send_modal(AddRoleModal())
@@ -823,7 +1021,11 @@ class DiscoOps(commands.Cog):
                 if inter.user.id != draft.creator_id:
                     return await inter.response.send_message("Only the organizer can change options.", ephemeral=True)
                 draft.comms = list(select.values)
-                await inter.response.send_message(f"Comms set to **{outer._format_comms(draft)}**.", ephemeral=True)
+                await outer._wizard_note_change(inter.guild, draft, f"Comms: {outer._format_comms(draft)}")
+                await inter.response.edit_message(
+                    content=f"Options updated.\n\n**Comms:** {outer._format_comms(draft)}\n**Calendar mode:** {draft.calendar_mode}",
+                    view=self,
+                )
                 await outer._refresh_preview(inter.guild, draft)
 
             @discord.ui.select(
@@ -841,7 +1043,11 @@ class DiscoOps(commands.Cog):
                 draft.calendar_mode = select.values[0]
                 if draft.calendar_mode != "LINK_EXISTING":
                     draft.linked_scheduled_event_id = None
-                await inter.response.send_message(f"Calendar mode set to **{draft.calendar_mode}**.", ephemeral=True)
+                await outer._wizard_note_change(inter.guild, draft, f"Calendar mode: {draft.calendar_mode}")
+                await inter.response.edit_message(
+                    content=f"Options updated.\n\n**Comms:** {outer._format_comms(draft)}\n**Calendar mode:** {draft.calendar_mode}",
+                    view=self,
+                )
                 await outer._refresh_preview(inter.guild, draft)
 
             @discord.ui.button(label="Sync edits to calendar: ON" if draft.sync_back_to_calendar else "Sync edits to calendar: OFF",
@@ -851,7 +1057,18 @@ class DiscoOps(commands.Cog):
                     return await inter.response.send_message("Only the organizer can change options.", ephemeral=True)
                 draft.sync_back_to_calendar = not draft.sync_back_to_calendar
                 btn.label = "Sync edits to calendar: ON" if draft.sync_back_to_calendar else "Sync edits to calendar: OFF"
-                await inter.response.edit_message(view=self)
+                try:
+                    await outer._wizard_note_change(
+                        inter.guild,
+                        draft,
+                        f"Sync back to calendar: {'ON' if draft.sync_back_to_calendar else 'OFF'}",
+                    )
+                except Exception:
+                    pass
+                await inter.response.edit_message(
+                    content=f"Options updated.\n\n**Comms:** {outer._format_comms(draft)}\n**Calendar mode:** {draft.calendar_mode}",
+                    view=self,
+                )
                 await outer._refresh_preview(inter.guild, draft)
 
             @discord.ui.button(label="Done", style=discord.ButtonStyle.success)
@@ -921,9 +1138,52 @@ class DiscoOps(commands.Cog):
     async def _post_canonical_event(self, guild: discord.Guild, draft: EventDraft, channel_hint: Optional[int] = None) -> discord.Message:
         """Post the final published event message."""
         channel = guild.get_channel(channel_hint) if channel_hint else guild.text_channels[0]
-        embed = self._build_public_embed(draft)
-        view = self._build_public_view(disabled=True)  # disabled placeholders until signups wired
-        msg = await channel.send(embed=embed, view=view)
+        post = {
+            "event_id": draft.event_id,
+            "guild_id": guild.id,
+            "title": draft.title or "Untitled Event",
+            "starts_at_ts": int(draft.starts_at.timestamp()) if draft.starts_at else None,
+            "ends_at_ts": int(draft.ends_at.timestamp()) if draft.ends_at else None,
+            "comms": list(draft.comms or []),
+            "description_md": draft.description_md or "",
+            "image_url": draft.image_url,
+            "linked_scheduled_event_id": draft.linked_scheduled_event_id,
+            "roles": {rid: self._role_to_dict(r) for rid, r in (draft.roles or {}).items()},
+            "interested": [],
+            "signups": {},
+        }
+
+        content = self._build_public_markdown(post)
+        view = self._build_public_view(event_id=draft.event_id, disabled=False)
+        msg = await channel.send(content=content, view=view, allowed_mentions=discord.AllowedMentions.none())
+
+        # Store for later updates
+        post["channel_id"] = channel.id
+        post["message_id"] = msg.id
+        async with self.config.guild(guild).event_posts() as posts:
+            posts[str(draft.event_id)] = post
+
+        # Long description as follow-ups (no buttons)
+        desc = (draft.description_md or "").strip()
+        if desc:
+            # Keep it markdown, but split for safety
+            chunks, cur = [], ""
+            for ln in desc.splitlines() or [desc]:
+                nxt = (cur + ("\n" if cur else "") + ln)
+                if len(nxt) > MAX_MSG:
+                    if cur:
+                        chunks.append(cur)
+                    cur = ln
+                else:
+                    cur = nxt
+            if cur:
+                chunks.append(cur)
+            for i, chnk in enumerate(chunks[:5], start=1):
+                header = f"## Details" if i == 1 else "## Details (continued)"
+                await channel.send(
+                    f"{header}\n{chnk}"[:MAX_MSG],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
         # Create a discussion thread from the message if configured
         if draft.discussion_mode == "THREAD":
@@ -933,44 +1193,197 @@ class DiscoOps(commands.Cog):
                 pass
         return msg
 
-    def _build_public_embed(self, draft: EventDraft) -> discord.Embed:
-        """Build the public embed for a published event."""
-        title = draft.title or "Untitled Event"
-        e = discord.Embed(title=title, colour=discord.Colour.green())
-        when = "TBD"
-        if draft.starts_at:
-            when = discord.utils.format_dt(draft.starts_at, style="F")
-            if draft.ends_at:
-                when += f" → {discord.utils.format_dt(draft.ends_at, style='t')}"
-        e.description = (
-            f"**When:** {when}\n"
-            f"**Comms:** {self._format_comms(draft)}\n"
-            f"{draft.description_md[:1800]}"
-        )
-        if draft.image_url:
-            e.set_image(url=draft.image_url)
-        e.set_footer(text="Use the buttons below to register interest and pick a role.")
-        if draft.linked_scheduled_event_id:
-            e.add_field(name="Calendar", value=f"Linked Scheduled Event ID: `{draft.linked_scheduled_event_id}`", inline=False)
-        if draft.roles:
-            role_lines = []
-            for r in draft.roles.values():
-                cap = "∞" if r.capacity is None else r.capacity
-                label = f"{r.emoji} {r.label}" if r.emoji else r.label
-                extra = f" — {r.description}" if r.description else ""
-                role_lines.append(f"• {label} ({cap}){extra}")
-            e.add_field(name="Roles", value="\n".join(role_lines)[:1024], inline=False)
-        return e
-
-    def _build_public_view(self, disabled: bool = True) -> discord.ui.View:
+    def _build_public_view(self, *, event_id: str, disabled: bool = False) -> discord.ui.View:
         """Build the public view for a published event."""
         class PublicView(discord.ui.View):
             def __init__(self, is_disabled: bool):
                 super().__init__(timeout=None)
-                self.add_item(discord.ui.Button(label="Interested", style=discord.ButtonStyle.primary, custom_id="evt:interest", disabled=is_disabled))
-                self.add_item(discord.ui.Button(label="Sign Up / Manage Role", style=discord.ButtonStyle.success, custom_id="evt:signup", disabled=is_disabled))
-                self.add_item(discord.ui.Button(label="View Details", style=discord.ButtonStyle.secondary, custom_id="evt:view", disabled=is_disabled))
+                self.add_item(
+                    discord.ui.Button(
+                        label="Interested",
+                        style=discord.ButtonStyle.primary,
+                        custom_id=outer._public_view_custom_id("interest", str(event_id)),
+                        disabled=is_disabled,
+                    )
+                )
+                self.add_item(
+                    discord.ui.Button(
+                        label="Sign Up / Manage Role",
+                        style=discord.ButtonStyle.success,
+                        custom_id=outer._public_view_custom_id("signup", str(event_id)),
+                        disabled=is_disabled,
+                    )
+                )
+                self.add_item(
+                    discord.ui.Button(
+                        label="View Details",
+                        style=discord.ButtonStyle.secondary,
+                        custom_id=outer._public_view_custom_id("view", str(event_id)),
+                        disabled=is_disabled,
+                    )
+                )
+
+        outer = self
         return PublicView(disabled)
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Route published event button interactions (markdown post buttons)."""
+        try:
+            if not interaction or not getattr(interaction, "data", None):
+                return
+            data = interaction.data or {}
+            custom_id = data.get("custom_id")
+            if not custom_id or not isinstance(custom_id, str):
+                return
+            if not custom_id.startswith("evtpub:"):
+                return
+            parts = custom_id.split(":")
+            if len(parts) < 3:
+                return
+            action = parts[1]
+            event_id = ":".join(parts[2:])
+
+            if not interaction.guild:
+                return await self._send_ephemeral(interaction, "This can only be used in a server.")
+
+            if action == "interest":
+                await self._handle_public_interest(interaction, event_id)
+            elif action == "signup":
+                await self._handle_public_signup(interaction, event_id)
+            elif action == "view":
+                await self._handle_public_view_details(interaction, event_id)
+        except Exception:
+            # Never let interaction routing crash the cog
+            pass
+
+    async def _handle_public_interest(self, interaction: discord.Interaction, event_id: str):
+        guild = interaction.guild
+        uid = interaction.user.id
+        async with self.config.guild(guild).event_posts() as posts:
+            post = posts.get(str(event_id))
+            if not post:
+                return await self._send_ephemeral(interaction, "This event post is no longer tracked.")
+            interested = post.get("interested") or []
+            if uid in interested:
+                interested = [i for i in interested if i != uid]
+                post["interested"] = interested
+                posts[str(event_id)] = post
+                await self._send_ephemeral(interaction, "You are no longer marked as interested.")
+            else:
+                interested.append(uid)
+                post["interested"] = interested
+                posts[str(event_id)] = post
+                await self._send_ephemeral(interaction, "Marked you as interested.")
+
+        await self._update_published_post_message(guild, event_id)
+
+    async def _handle_public_signup(self, interaction: discord.Interaction, event_id: str):
+        guild = interaction.guild
+        posts = await self.config.guild(guild).event_posts()
+        post = posts.get(str(event_id))
+        if not post:
+            return await self._send_ephemeral(interaction, "This event post is no longer tracked.")
+
+        roles = post.get("roles") or {}
+        if not roles:
+            return await self._send_ephemeral(interaction, "No roles are configured for this event.")
+
+        outer = self
+
+        # Build options
+        options = [
+            discord.SelectOption(label="Withdraw / No role", value="", description="Remove your signup")
+        ]
+        for rid, rd in roles.items():
+            try:
+                r = self._role_from_dict(rd)
+            except Exception:
+                continue
+            cap = "∞" if r.capacity is None else str(r.capacity)
+            label = f"{r.emoji} {r.label}" if r.emoji else r.label
+            desc = f"Cap: {cap}" + (f" • {r.description}" if r.description else "")
+            options.append(discord.SelectOption(label=label[:100], value=str(rid), description=desc[:100]))
+
+        class SignupView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=120)
+
+            @discord.ui.select(placeholder="Pick your role…", options=options, min_values=1, max_values=1)
+            async def select_role(self, inter: discord.Interaction, select: discord.ui.Select):
+                if inter.user.id != interaction.user.id:
+                    return await inter.response.send_message("This menu is only for you.", ephemeral=True)
+                chosen = select.values[0]  # may be ""
+                await outer._apply_signup_choice(inter, event_id=str(event_id), role_id=str(chosen))
+                try:
+                    self.stop()
+                except Exception:
+                    pass
+
+        await self._send_ephemeral(interaction, "Choose a role:", view=SignupView())
+
+    async def _apply_signup_choice(self, interaction: discord.Interaction, *, event_id: str, role_id: str):
+        guild = interaction.guild
+        uid_str = str(interaction.user.id)
+
+        async with self.config.guild(guild).event_posts() as posts:
+            post = posts.get(str(event_id))
+            if not post:
+                return await interaction.response.send_message("This event post is no longer tracked.", ephemeral=True)
+            roles = post.get("roles") or {}
+            signups = post.get("signups") or {}
+
+            prev = str(signups.get(uid_str) or "")
+
+            # Capacity enforcement (only if changing into a role)
+            if role_id:
+                rd = roles.get(str(role_id))
+                if not rd:
+                    return await interaction.response.send_message("That role is no longer available.", ephemeral=True)
+                r = self._role_from_dict(rd)
+                if r.capacity is not None and str(role_id) != prev:
+                    # count current occupants
+                    occ = 0
+                    for _u, rid in signups.items():
+                        if str(rid or "") == str(role_id):
+                            occ += 1
+                    if occ >= int(r.capacity):
+                        return await interaction.response.send_message(
+                            f"That role is full (**{occ}/{r.capacity}**).",
+                            ephemeral=True,
+                        )
+
+            # Apply
+            if not role_id:
+                if uid_str in signups:
+                    del signups[uid_str]
+                post["signups"] = signups
+                posts[str(event_id)] = post
+                await interaction.response.send_message("Signup removed.", ephemeral=True)
+            else:
+                signups[uid_str] = str(role_id)
+                post["signups"] = signups
+                posts[str(event_id)] = post
+
+                rd = roles.get(str(role_id)) or {}
+                r = self._role_from_dict(rd)
+                await interaction.response.send_message(f"Signed you up as **{r.label}**.", ephemeral=True)
+
+        await self._update_published_post_message(guild, event_id)
+
+    async def _handle_public_view_details(self, interaction: discord.Interaction, event_id: str):
+        guild = interaction.guild
+        posts = await self.config.guild(guild).event_posts()
+        post = posts.get(str(event_id))
+        if not post:
+            return await self._send_ephemeral(interaction, "This event post is no longer tracked.")
+        title = post.get("title") or "Untitled Event"
+        desc = (post.get("description_md") or "").strip()
+        if not desc:
+            desc = "*No details provided.*"
+        # Ephemeral also has message limits; show a safe slice.
+        msg = f"# {title}\n\n{desc}"[:MAX_MSG]
+        await self._send_ephemeral(interaction, msg)
 
     # ============= Command Group =============
 
