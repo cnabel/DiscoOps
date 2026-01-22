@@ -139,6 +139,36 @@ Example:
 Role hierarchy requirement:
 - The bot can only manage roles below its highest role. If role hierarchy prevents management, create will fail with guidance.
 
+## Detailed Event Wizard
+
+```text
+[p]do event create
+```
+
+Behavior:
+- Opens an interactive wizard to create detailed event posts with rich information and custom participation roles.
+- Creates a live preview message with interactive buttons (Edit Description, Roles Builder, Options, Publish, Cancel).
+
+Workflow:
+1. **Link Calendar Event** — Optionally select or paste a Discord Scheduled Event to import details (title, dates, location, description, image).
+2. **Edit Description** — Opens a modal to edit the event description with markdown support.
+3. **Roles Builder** — Add custom participation roles (e.g., Tank, Healer, DPS) with optional emoji, capacity limits, and descriptions.
+4. **Options** — Configure calendar sync behavior (whether edits should sync back to the linked scheduled event).
+5. **Publish** — Creates the final event message with an embed and optional discussion thread.
+6. **Cancel** — Removes the draft and preview message.
+
+Features:
+- Live preview embed updates as you configure the event.
+- Import event details from Discord Scheduled Events.
+- Custom role options with emoji, labels, capacity limits, and descriptions.
+- Option to sync edits back to the linked calendar event.
+- Automatic discussion thread creation on publish.
+
+Notes:
+- Only the organizer (user who started the wizard) can interact with the draft controls.
+- Drafts are stored in memory and will be lost if the bot restarts.
+- The published event uses embeds (unlike other DiscoOps commands which use plain text).
+
 ## Logs / Debug (Owner Only)
 
 ### View Recent Logs

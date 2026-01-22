@@ -1,11 +1,13 @@
 # File: discoops/discoops.py
 
+from __future__ import annotations
 import discord
 from redbot.core import commands, Config
 from redbot.core.data_manager import cog_data_path
 from datetime import datetime, timedelta, timezone
 import asyncio
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List
 import unicodedata
 import os
 from pathlib import Path
@@ -15,6 +17,46 @@ MAX_LOG_BYTES = 1_000_000  # 1 MB cap for on-disk log
 MAX_LOG_DAYS = 14          # delete entries older than 14 days
 CLEANUP_EVERY_WRITES = 50  # run time-based cleanup every N writes
 PERSIST_COUNTER_EVERY = 10 # persist log_writes counter every N writes to reduce I/O
+
+
+# --- Data models for Detailed Events Wizard ---
+
+@dataclass
+class RoleDraft:
+    """A role option for an event (e.g., Tank, Healer, DPS)."""
+    role_id: str
+    label: str
+    capacity: Optional[int] = None
+    emoji: Optional[str] = None
+    description: Optional[str] = None
+
+
+@dataclass
+class EventDraft:
+    """A draft event being created via the wizard."""
+    event_id: str
+    guild_id: int
+    creator_id: int
+    title: str = ""
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    location: str = ""
+    description_md: str = ""
+    image_url: Optional[str] = None
+    max_attendees: Optional[int] = None
+    waitlist_enabled: bool = True
+    dm_on_interest: bool = True
+    discussion_mode: str = "THREAD"   # or "CHANNEL"
+    draft_channel_id: Optional[int] = None
+    preview_message_id: Optional[int] = None
+    status: str = "DRAFT"
+    roles: Dict[str, RoleDraft] = field(default_factory=dict)
+
+    # Calendar integration
+    calendar_mode: str = "LINK_EXISTING"      # "LINK_EXISTING" | "NONE"
+    linked_scheduled_event_id: Optional[int] = None
+    linked_snapshot: dict = field(default_factory=dict)
+    sync_back_to_calendar: bool = True  # toggle in Options
 
 
 class DiscoOps(commands.Cog):
@@ -35,6 +77,10 @@ class DiscoOps(commands.Cog):
         data_dir = cog_data_path(self)
         data_dir.mkdir(parents=True, exist_ok=True)
         self._log_path = data_dir / "discoops.log"
+
+        # Detailed Events wizard storage
+        self._drafts: Dict[int, EventDraft] = {}   # key: organizer user id -> EventDraft
+        self._draft_locks: Dict[str, asyncio.Lock] = {}  # key: event_id -> lock
 
     async def cog_unload(self):
         """Persist the log_writes counter when the cog is unloaded."""
@@ -274,6 +320,509 @@ class DiscoOps(commands.Cog):
         if ping:
             await ctx.send(ping, allowed_mentions=ping_mentions)
 
+    # --------- Detailed Events Wizard helpers ----------
+
+    def _draft_lock(self, event_id: str) -> asyncio.Lock:
+        """Get or create a lock for a specific event draft."""
+        self._draft_locks.setdefault(event_id, asyncio.Lock())
+        return self._draft_locks[event_id]
+
+    def _new_event_id(self, ctx: commands.Context) -> str:
+        """Generate a unique event ID for a new draft."""
+        return f"ev-{ctx.guild.id}-{ctx.author.id}-{int(datetime.now(timezone.utc).timestamp())}"
+
+    def _build_preview_embed(self, draft: EventDraft) -> discord.Embed:
+        """Build the preview embed for an event draft."""
+        title = draft.title or "Untitled Event"
+        e = discord.Embed(title=f"📝 {title} • DRAFT", colour=discord.Colour.blurple())
+        when = "TBD"
+        if draft.starts_at:
+            when = discord.utils.format_dt(draft.starts_at, style="F")
+            if draft.ends_at:
+                when += f" → {discord.utils.format_dt(draft.ends_at, style='t')}"
+        e.description = (
+            f"**Status:** DRAFT (not published)\n"
+            f"**When:** {when}\n"
+            f"**Where:** {draft.location or 'TBD'}\n"
+            f"**Calendar Link:** {'Linked' if draft.linked_scheduled_event_id else 'None'}\n\n"
+            f"{draft.description_md[:1800] or '*No description yet.*'}"
+        )
+        if draft.image_url:
+            e.set_image(url=draft.image_url)
+
+        # Roles summary
+        if draft.roles:
+            role_lines = []
+            for r in draft.roles.values():
+                cap = "∞" if r.capacity is None else r.capacity
+                label = f"{r.emoji} {r.label}" if r.emoji else r.label
+                extra = f" — {r.description}" if r.description else ""
+                role_lines.append(f"• {label} ({cap}){extra}")
+            e.add_field(name="Roles", value="\n".join(role_lines)[:1024], inline=False)
+
+        e.set_footer(text=f"Preview • Event ID: {draft.event_id}")
+        return e
+
+    def _build_preview_controls(self, draft: EventDraft, organizer_id: int) -> discord.ui.View:
+        """Build the control buttons for the draft preview message."""
+        outer = self
+
+        class PreviewView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=None)
+
+            async def _check(self, interaction: discord.Interaction) -> bool:
+                if interaction.user.id != organizer_id:
+                    await interaction.response.send_message("Only the organizer can control this draft.", ephemeral=True)
+                    return False
+                return True
+
+            @discord.ui.button(label="Edit Description", style=discord.ButtonStyle.secondary, custom_id=f"evt:desc:{draft.event_id}")
+            async def edit_desc(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if not await self._check(interaction):
+                    return
+                await outer._open_description_modal(interaction, draft)
+
+            @discord.ui.button(label="Roles Builder", style=discord.ButtonStyle.secondary, custom_id=f"evt:roles:{draft.event_id}")
+            async def roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if not await self._check(interaction):
+                    return
+                await outer._open_roles_builder(interaction, draft)
+
+            @discord.ui.button(label="Options", style=discord.ButtonStyle.secondary, custom_id=f"evt:opts:{draft.event_id}")
+            async def opts(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if not await self._check(interaction):
+                    return
+                await outer._open_options_view(interaction, draft)
+
+            @discord.ui.button(label="Publish", style=discord.ButtonStyle.success, custom_id=f"evt:publish:{draft.event_id}")
+            async def publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if not await self._check(interaction):
+                    return
+                await outer._publish_from_draft(interaction, draft)
+
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, custom_id=f"evt:cancel:{draft.event_id}")
+            async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if not await self._check(interaction):
+                    return
+                await outer._cancel_draft(interaction, draft)
+
+        return PreviewView()
+
+    async def _refresh_preview(self, guild: discord.Guild, draft: EventDraft):
+        """Refresh the preview message for an event draft."""
+        if not draft.preview_message_id or not draft.draft_channel_id:
+            return
+        channel = guild.get_channel(draft.draft_channel_id)
+        if not channel:
+            return
+        embed = self._build_preview_embed(draft)
+        view = self._build_preview_controls(draft, organizer_id=draft.creator_id)
+        try:
+            msg = await channel.fetch_message(draft.preview_message_id)
+            await msg.edit(embed=embed, view=view)
+        except discord.NotFound:
+            new_msg = await channel.send(embed=embed, view=view)
+            draft.preview_message_id = new_msg.id
+
+    async def _start_wizard_with_preview(self, ctx: commands.Context, preset_title: Optional[str] = None) -> EventDraft:
+        """Start the wizard and create the preview message."""
+        event_id = self._new_event_id(ctx)
+        draft = EventDraft(
+            event_id=event_id,
+            guild_id=ctx.guild.id,
+            creator_id=ctx.author.id,
+            draft_channel_id=ctx.channel.id,
+            title=preset_title or "",
+        )
+        self._drafts[ctx.author.id] = draft
+
+        embed = self._build_preview_embed(draft)
+        view = self._build_preview_controls(draft, organizer_id=ctx.author.id)
+        preview = await ctx.channel.send(embed=embed, view=view)
+        draft.preview_message_id = preview.id
+        return draft
+
+    async def _open_scheduled_event_picker(self, ctx: commands.Context, draft: EventDraft):
+        """Open the scheduled event picker for linking an existing calendar event."""
+        guild: discord.Guild = ctx.guild
+        scheduled: List[discord.GuildScheduledEvent] = await self._get_scheduled_events(guild, with_counts=False)
+
+        outer = self
+
+        class EventPicker(discord.ui.View):
+            def __init__(self, scheduled_events: List[discord.GuildScheduledEvent]):
+                super().__init__(timeout=300)
+                self.scheduled_events = list(scheduled_events) if scheduled_events else []
+                if self.scheduled_events:
+                    self.add_item(self._build_select())
+
+            def _build_select(self) -> discord.ui.Select:
+                opts = []
+                for ev in self.scheduled_events[:25]:
+                    label = (ev.name or "Untitled")[:100]
+                    starts = ev.start_time.strftime("%Y-%m-%d %H:%M") if ev.start_time else "TBD"
+                    desc = f"{starts} • {str(ev.entity_type).split('.')[-1].title()}"
+                    opts.append(discord.SelectOption(label=label, description=desc[:100], value=str(ev.id)))
+                select = discord.ui.Select(placeholder="Pick a scheduled event…", options=opts, custom_id=f"evt:pick:{draft.event_id}")
+
+                async def on_select(interaction: discord.Interaction):
+                    if interaction.user.id != draft.creator_id:
+                        return await interaction.response.send_message("Only the organizer can select an event for this draft.", ephemeral=True)
+                    ev_id = int(select.values[0])
+                    ev = discord.utils.get(self.scheduled_events, id=ev_id)
+                    await outer._hydrate_draft_from_scheduled(interaction, draft, ev)
+
+                select.callback = on_select
+                return select
+
+            @discord.ui.button(label="Refresh list", style=discord.ButtonStyle.secondary)
+            async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if interaction.user.id != draft.creator_id:
+                    return await interaction.response.send_message("Only the organizer can refresh.", ephemeral=True)
+                new_list = await outer._get_scheduled_events(interaction.guild, with_counts=False)
+                # Create a new view instead of trying to re-add buttons
+                new_view = EventPicker(new_list if new_list else [])
+                await interaction.response.edit_message(view=new_view)
+
+            @discord.ui.button(label="Paste event ID/URL", style=discord.ButtonStyle.primary)
+            async def paste(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if interaction.user.id != draft.creator_id:
+                    return await interaction.response.send_message("Only the organizer can paste.", ephemeral=True)
+                await outer._open_paste_event_modal(interaction, draft)
+
+            @discord.ui.button(label="Create without calendar", style=discord.ButtonStyle.secondary)
+            async def no_cal(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if interaction.user.id != draft.creator_id:
+                    return await interaction.response.send_message("Only the organizer can continue.", ephemeral=True)
+                draft.calendar_mode = "NONE"
+                draft.linked_scheduled_event_id = None
+                await interaction.response.send_message("Continuing without linking a calendar event.", ephemeral=True)
+                await outer._open_description_modal_followup(interaction, draft)
+
+        # Send the picker prompt
+        await ctx.send(
+            "Select a scheduled event to import details:",
+            view=EventPicker(scheduled),
+            delete_after=300,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _open_paste_event_modal(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open a modal to paste an event ID or URL."""
+        outer = self
+
+        class PasteModal(discord.ui.Modal, title="Link Scheduled Event"):
+            ev_input = discord.ui.TextInput(label="Event ID or URL", required=True, max_length=200)
+
+            async def on_submit(self, inter: discord.Interaction):
+                raw = str(self.ev_input).strip()
+                ev_id = None
+                tokenized = raw.replace("<", "").replace(">", "").split("/")
+                for token in tokenized:
+                    if token.isdigit():
+                        ev_id = int(token)
+                if not ev_id:
+                    return await inter.response.send_message("Couldn't find an event ID in that input.", ephemeral=True)
+
+                try:
+                    ev = await inter.guild.fetch_scheduled_event(ev_id)
+                except discord.NotFound:
+                    return await inter.response.send_message("No scheduled event with that ID.", ephemeral=True)
+
+                await outer._hydrate_draft_from_scheduled(inter, draft, ev)
+
+        await interaction.response.send_modal(PasteModal())
+
+    async def _hydrate_draft_from_scheduled(self, interaction: discord.Interaction, draft: EventDraft, ev: discord.GuildScheduledEvent):
+        """Import details from a scheduled event into the draft."""
+        draft.calendar_mode = "LINK_EXISTING"
+        draft.linked_scheduled_event_id = ev.id
+        draft.title = ev.name or draft.title or "Untitled Event"
+        draft.starts_at = ev.start_time
+        draft.ends_at = ev.end_time
+
+        if ev.entity_type in (discord.EntityType.voice, discord.EntityType.stage_instance):
+            draft.location = ev.channel.name if ev.channel else "Voice/Stage (channel unavailable)"
+        elif ev.entity_type == discord.EntityType.external:
+            draft.location = getattr(ev.entity_metadata, "location", "External") if ev.entity_metadata else "External"
+        else:
+            draft.location = "TBD"
+
+        draft.description_md = (ev.description or "").strip()
+
+        try:
+            if hasattr(ev, "image") and ev.image:
+                draft.image_url = ev.image.url
+        except Exception:
+            pass
+
+        if ev.creator:
+            draft.linked_snapshot["calendar_creator_id"] = ev.creator.id
+
+        draft.linked_snapshot.update({
+            "name": ev.name,
+            "start": ev.start_time.isoformat() if ev.start_time else None,
+            "end": ev.end_time.isoformat() if ev.end_time else None,
+            "entity_type": str(ev.entity_type),
+            "location": getattr(ev.entity_metadata, "location", None) if ev.entity_metadata else None,
+            "description": ev.description,
+            "image": getattr(ev.image, "url", None) if hasattr(ev, "image") and ev.image else None,
+        })
+
+        await interaction.response.send_message(f"Imported **{ev.name}** from the calendar.", ephemeral=True)
+        await self._refresh_preview(interaction.guild, draft)
+        await self._open_description_modal_followup(interaction, draft)
+
+    def _create_description_modal(self, draft: EventDraft):
+        """Create a description modal for the given draft."""
+        outer = self
+
+        class DescriptionModal(discord.ui.Modal, title="Event Description"):
+            description = discord.ui.TextInput(
+                label="Long description (markdown ok)",
+                style=discord.TextStyle.long,
+                required=False,
+                max_length=4000,
+                placeholder="Add details, agenda, requirements, links…",
+                default=draft.description_md or ""
+            )
+
+            async def on_submit(self, inter: discord.Interaction):
+                draft.description_md = str(self.description)
+                await inter.response.send_message("Description saved.", ephemeral=True)
+                await outer._refresh_preview(inter.guild, draft)
+
+        return DescriptionModal()
+
+    async def _open_description_modal(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open the description editing modal (as response)."""
+        await interaction.response.send_modal(self._create_description_modal(draft))
+
+    async def _open_description_modal_followup(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open the description editing modal (as followup after another response)."""
+        outer = self
+
+        # Send a button to open the modal since we can't send a modal from followup
+        class OpenModalView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=300)
+
+            @discord.ui.button(label="Edit Description", style=discord.ButtonStyle.primary)
+            async def open_modal(self, inter: discord.Interaction, button: discord.ui.Button):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can edit.", ephemeral=True)
+                await inter.response.send_modal(outer._create_description_modal(draft))
+
+        await interaction.followup.send("Click to edit the event description:", view=OpenModalView(), ephemeral=True)
+
+    async def _open_roles_builder(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open the roles builder view."""
+        outer = self
+
+        class RolesView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=300)
+
+            @discord.ui.button(label="Add Role", style=discord.ButtonStyle.primary)
+            async def add_role(self, inter: discord.Interaction, button: discord.ui.Button):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can edit roles.", ephemeral=True)
+                await outer._open_add_role_modal(inter, draft)
+
+            @discord.ui.button(label="Done", style=discord.ButtonStyle.success)
+            async def done(self, inter: discord.Interaction, button: discord.ui.Button):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can continue.", ephemeral=True)
+                await inter.response.send_message("Roles saved.", ephemeral=True)
+
+        # Show a compact summary as ephemeral message
+        summary = "No roles yet." if not draft.roles else "\n".join(
+            f"• {(r.emoji + ' ') if r.emoji else ''}{r.label} ({'∞' if r.capacity is None else r.capacity})" for r in draft.roles.values()
+        )
+        await interaction.followup.send(f"**Roles so far:**\n{summary}", view=RolesView(), ephemeral=True)
+
+    async def _open_add_role_modal(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open a modal to add a new role option."""
+        outer = self
+
+        class AddRoleModal(discord.ui.Modal, title="Add Role Option"):
+            label = discord.ui.TextInput(label="Label", required=True, max_length=50)
+            capacity = discord.ui.TextInput(label="Capacity (blank = unlimited)", required=False, max_length=6)
+            emoji = discord.ui.TextInput(label="Emoji (optional)", required=False, max_length=10, placeholder="e.g., 🛡️")
+            desc = discord.ui.TextInput(label="Description (optional)", required=False, max_length=100)
+
+            async def on_submit(self, inter: discord.Interaction):
+                rid = f"r{len(draft.roles)+1}"
+                cap_raw = str(self.capacity).strip()
+                cap_val: Optional[int] = None
+                if cap_raw:
+                    try:
+                        cap_val = max(0, int(cap_raw))
+                    except ValueError:
+                        return await inter.response.send_message("Capacity must be a number.", ephemeral=True)
+                rd = RoleDraft(
+                    role_id=rid,
+                    label=str(self.label).strip(),
+                    capacity=cap_val,
+                    emoji=str(self.emoji).strip() or None,
+                    description=str(self.desc).strip() or None,
+                )
+                draft.roles[rid] = rd
+                await inter.response.send_message(f"Added role **{rd.label}**.", ephemeral=True)
+                await outer._refresh_preview(inter.guild, draft)
+
+        await interaction.response.send_modal(AddRoleModal())
+
+    async def _open_options_view(self, interaction: discord.Interaction, draft: EventDraft):
+        """Open the options configuration view."""
+        outer = self
+
+        class OptionsView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=300)
+
+            @discord.ui.select(
+                placeholder="Calendar behavior",
+                options=[
+                    discord.SelectOption(label="Link existing (recommended)", value="LINK_EXISTING", default=(draft.calendar_mode=="LINK_EXISTING")),
+                    discord.SelectOption(label="No calendar", value="NONE", default=(draft.calendar_mode=="NONE")),
+                ],
+                min_values=1,
+                max_values=1,
+            )
+            async def calmode(self, inter: discord.Interaction, select: discord.ui.Select):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can change options.", ephemeral=True)
+                draft.calendar_mode = select.values[0]
+                if draft.calendar_mode != "LINK_EXISTING":
+                    draft.linked_scheduled_event_id = None
+                await inter.response.send_message(f"Calendar mode set to **{draft.calendar_mode}**.", ephemeral=True)
+                await outer._refresh_preview(inter.guild, draft)
+
+            @discord.ui.button(label="Sync edits to calendar: ON" if draft.sync_back_to_calendar else "Sync edits to calendar: OFF",
+                               style=discord.ButtonStyle.secondary)
+            async def sync_toggle(self, inter: discord.Interaction, btn: discord.ui.Button):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can change options.", ephemeral=True)
+                draft.sync_back_to_calendar = not draft.sync_back_to_calendar
+                btn.label = "Sync edits to calendar: ON" if draft.sync_back_to_calendar else "Sync edits to calendar: OFF"
+                await inter.response.edit_message(view=self)
+                await outer._refresh_preview(inter.guild, draft)
+
+            @discord.ui.button(label="Done", style=discord.ButtonStyle.success)
+            async def done(self, inter: discord.Interaction, button: discord.ui.Button):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can continue.", ephemeral=True)
+                await inter.response.send_message("Options saved. Use **Publish** under the preview message when ready.", ephemeral=True)
+
+        await interaction.followup.send("Options:", view=OptionsView(), ephemeral=True)
+
+    async def _publish_from_draft(self, interaction: discord.Interaction, draft: EventDraft):
+        """Publish the event from the draft."""
+        async with self._draft_lock(draft.event_id):
+            # Create the canonical event message
+            detailed_msg = await self._post_canonical_event(interaction.guild, draft, channel_hint=draft.draft_channel_id)
+
+            # Optionally: sync key fields back to calendar if linked & toggle is on
+            if draft.sync_back_to_calendar and draft.calendar_mode == "LINK_EXISTING" and draft.linked_scheduled_event_id:
+                try:
+                    cal = await interaction.guild.fetch_scheduled_event(draft.linked_scheduled_event_id)
+                    await cal.edit(
+                        name=draft.title or cal.name,
+                        start_time=draft.starts_at or cal.start_time,
+                        end_time=draft.ends_at or cal.end_time,
+                        description=(draft.description_md[:1000] or None)  # calendar limits
+                    )
+                except Exception:
+                    pass
+
+            # Mark the preview as published (or remove it)
+            try:
+                if draft.preview_message_id and draft.draft_channel_id:
+                    ch = interaction.guild.get_channel(draft.draft_channel_id)
+                    if ch:
+                        msg = await ch.fetch_message(draft.preview_message_id)
+                        await msg.edit(content="✅ Published.", embed=None, view=None)
+            except Exception:
+                pass
+
+            # Cleanup transient draft
+            self._drafts.pop(draft.creator_id, None)
+            draft.status = "PUBLISHED"
+
+            await interaction.response.send_message(f"Event published. Jump: {detailed_msg.jump_url}", ephemeral=True)
+            await self.log_info(f"{interaction.user} published event {draft.event_id} in guild {interaction.guild.id}")
+
+    async def _cancel_draft(self, interaction: discord.Interaction, draft: EventDraft):
+        """Cancel and delete the draft."""
+        # delete preview message if exists
+        try:
+            if draft.preview_message_id and draft.draft_channel_id:
+                ch = interaction.guild.get_channel(draft.draft_channel_id)
+                if ch:
+                    msg = await ch.fetch_message(draft.preview_message_id)
+                    await msg.delete()
+        except Exception:
+            pass
+        self._drafts.pop(draft.creator_id, None)
+        await interaction.response.send_message("Draft canceled and preview removed.", ephemeral=True)
+        await self.log_info(f"{interaction.user} canceled draft {draft.event_id} in guild {interaction.guild.id}")
+
+    async def _post_canonical_event(self, guild: discord.Guild, draft: EventDraft, channel_hint: Optional[int] = None) -> discord.Message:
+        """Post the final published event message."""
+        channel = guild.get_channel(channel_hint) if channel_hint else guild.text_channels[0]
+        embed = self._build_public_embed(draft)
+        view = self._build_public_view(disabled=True)  # disabled placeholders until signups wired
+        msg = await channel.send(embed=embed, view=view)
+
+        # Create a discussion thread from the message if configured
+        if draft.discussion_mode == "THREAD":
+            try:
+                await msg.create_thread(name=f"{draft.title} • Discussion")
+            except Exception:
+                pass
+        return msg
+
+    def _build_public_embed(self, draft: EventDraft) -> discord.Embed:
+        """Build the public embed for a published event."""
+        title = draft.title or "Untitled Event"
+        e = discord.Embed(title=title, colour=discord.Colour.green())
+        when = "TBD"
+        if draft.starts_at:
+            when = discord.utils.format_dt(draft.starts_at, style="F")
+            if draft.ends_at:
+                when += f" → {discord.utils.format_dt(draft.ends_at, style='t')}"
+        e.description = (
+            f"**When:** {when}\n"
+            f"**Where:** {draft.location or 'TBD'}\n"
+            f"{draft.description_md[:1800]}"
+        )
+        if draft.image_url:
+            e.set_image(url=draft.image_url)
+        e.set_footer(text="Use the buttons below to register interest and pick a role.")
+        if draft.linked_scheduled_event_id:
+            e.add_field(name="Calendar", value=f"Linked Scheduled Event ID: `{draft.linked_scheduled_event_id}`", inline=False)
+        if draft.roles:
+            role_lines = []
+            for r in draft.roles.values():
+                cap = "∞" if r.capacity is None else r.capacity
+                label = f"{r.emoji} {r.label}" if r.emoji else r.label
+                extra = f" — {r.description}" if r.description else ""
+                role_lines.append(f"• {label} ({cap}){extra}")
+            e.add_field(name="Roles", value="\n".join(role_lines)[:1024], inline=False)
+        return e
+
+    def _build_public_view(self, disabled: bool = True) -> discord.ui.View:
+        """Build the public view for a published event."""
+        class PublicView(discord.ui.View):
+            def __init__(self, is_disabled: bool):
+                super().__init__(timeout=None)
+                self.add_item(discord.ui.Button(label="Interested", style=discord.ButtonStyle.primary, custom_id="evt:interest", disabled=is_disabled))
+                self.add_item(discord.ui.Button(label="Sign Up / Manage Role", style=discord.ButtonStyle.success, custom_id="evt:signup", disabled=is_disabled))
+                self.add_item(discord.ui.Button(label="View Details", style=discord.ButtonStyle.secondary, custom_id="evt:view", disabled=is_disabled))
+        return PublicView(disabled)
+
     # ============= Command Group =============
 
     @commands.group(name="do", aliases=["discoops"])
@@ -435,11 +984,30 @@ class DiscoOps(commands.Cog):
         - `[p]do event list` — list scheduled events (plain messages, auto-paginated)
         - `[p]do event "Name"` — show summary + interested members (plain messages, auto-paginated)
         - `[p]do event role <create|sync|delete> "Name"`
+        - `[p]do event create` — start the detailed event wizard
         """
         if event_name:
             await self._event_info_with_members(ctx, event_name)
         else:
             await ctx.send_help(ctx.command)
+
+    @event_group.command(name="create")
+    async def event_create(self, ctx: commands.Context):
+        """
+        Start the detailed event wizard.
+
+        This wizard lets you create a detailed event post by:
+        1. Optionally linking an existing Discord Scheduled Event
+        2. Editing the description
+        3. Adding custom role options (e.g., Tank, Healer, DPS)
+        4. Configuring options (calendar sync)
+        5. Publishing the event
+
+        Usage: [p]do event create
+        """
+        await self.log_info(f"{ctx.author} started event wizard in guild {ctx.guild.id}")
+        draft = await self._start_wizard_with_preview(ctx)
+        await self._open_scheduled_event_picker(ctx, draft)
 
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
@@ -895,6 +1463,7 @@ class DiscoOps(commands.Cog):
             "`[p]do event list` — List scheduled events (plain messages, paginated)\n"
             "`[p]do event \"Event Name\"` — Show one event (+ members)\n"
             "`[p]do event role <create|sync|delete> \"Event Name\" [--ping]` — Manage event role\n"
+            "`[p]do event create` — Start the detailed event wizard\n"
         )
         await self._send_paginated(ctx, [help_md])
 
