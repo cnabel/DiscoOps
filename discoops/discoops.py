@@ -1195,6 +1195,8 @@ class DiscoOps(commands.Cog):
         """Open publish destination picker (category -> channel)."""
         if interaction.user.id != draft.creator_id:
             return await self._send_ephemeral(interaction, "Only the organizer can publish this draft.")
+        # Channel enumeration can take long on large servers; acknowledge quickly.
+        await self._defer_ephemeral(interaction, thinking=True)
         await self._open_publish_destination(interaction, draft)
 
     async def _cleanup_wizard_messages(self, guild: discord.Guild, draft: EventDraft):
