@@ -40,7 +40,7 @@ class EventDraft:
     title: str = ""
     starts_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None
-    location: str = ""
+    comms: List[str] = field(default_factory=lambda: ["DISCORD"])  # DISCORD | SRS
     description_md: str = ""
     image_url: Optional[str] = None
     max_attendees: Optional[int] = None
@@ -322,14 +322,55 @@ class DiscoOps(commands.Cog):
 
     # --------- Detailed Events Wizard helpers ----------
 
+    async def _defer_ephemeral(self, interaction: discord.Interaction, *, thinking: bool = True) -> bool:
+        """Defer an interaction ephemerally if not already acknowledged."""
+        try:
+            if interaction.response.is_done():
+                return False
+            await interaction.response.defer(ephemeral=True, thinking=thinking)
+            return True
+        except Exception:
+            return False
+
+    async def _send_ephemeral(
+        self,
+        interaction: discord.Interaction,
+        content: str,
+        *,
+        view: Optional[discord.ui.View] = None,
+    ):
+        """Send an ephemeral interaction response safely (response or followup)."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(content, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(content, view=view, ephemeral=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_comms(draft: EventDraft) -> str:
+        vals = set(draft.comms or [])
+        if not vals:
+            return "TBD"
+        parts = []
+        if "DISCORD" in vals:
+            parts.append("Discord")
+        if "SRS" in vals:
+            parts.append("SRS")
+        return " + ".join(parts) if parts else "TBD"
+
     def _draft_lock(self, event_id: str) -> asyncio.Lock:
         """Get or create a lock for a specific event draft."""
         self._draft_locks.setdefault(event_id, asyncio.Lock())
         return self._draft_locks[event_id]
 
-    def _new_event_id(self, ctx: commands.Context) -> str:
+    def _new_event_id_values(self, guild_id: int, author_id: int) -> str:
         """Generate a unique event ID for a new draft."""
-        return f"ev-{ctx.guild.id}-{ctx.author.id}-{int(datetime.now(timezone.utc).timestamp())}"
+        return f"ev-{guild_id}-{author_id}-{int(datetime.now(timezone.utc).timestamp())}"
+
+    def _new_event_id(self, ctx: commands.Context) -> str:
+        return self._new_event_id_values(ctx.guild.id, ctx.author.id)
 
     def _build_preview_embed(self, draft: EventDraft) -> discord.Embed:
         """Build the preview embed for an event draft."""
@@ -343,7 +384,7 @@ class DiscoOps(commands.Cog):
         e.description = (
             f"**Status:** DRAFT (not published)\n"
             f"**When:** {when}\n"
-            f"**Where:** {draft.location or 'TBD'}\n"
+            f"**Comms:** {self._format_comms(draft)}\n"
             f"**Calendar Link:** {'Linked' if draft.linked_scheduled_event_id else 'None'}\n\n"
             f"{draft.description_md[:1800] or '*No description yet.*'}"
         )
@@ -443,10 +484,49 @@ class DiscoOps(commands.Cog):
         draft.preview_message_id = preview.id
         return draft
 
-    async def _open_scheduled_event_picker(self, ctx: commands.Context, draft: EventDraft):
-        """Open the scheduled event picker for linking an existing calendar event."""
+    async def _resolve_scheduled_event(self, guild: discord.Guild, ev_id: int) -> Optional[discord.GuildScheduledEvent]:
+        """Resolve a scheduled event by id, with fallbacks."""
+        try:
+            return await guild.fetch_scheduled_event(ev_id)
+        except AttributeError:
+            events = await self._get_scheduled_events(guild, with_counts=False)
+            return discord.utils.get(events, id=ev_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            events = await self._get_scheduled_events(guild, with_counts=False)
+            return discord.utils.get(events, id=ev_id)
+
+    async def _create_draft_with_preview(
+        self,
+        *,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        organizer: discord.abc.User,
+        preset_title: Optional[str] = None,
+    ) -> EventDraft:
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None:
+            raise RuntimeError("Channel has no id")
+        event_id = self._new_event_id_values(guild.id, organizer.id)
+        draft = EventDraft(
+            event_id=event_id,
+            guild_id=guild.id,
+            creator_id=organizer.id,
+            draft_channel_id=channel_id,
+            title=preset_title or "",
+        )
+        self._drafts[organizer.id] = draft
+        embed = self._build_preview_embed(draft)
+        view = self._build_preview_controls(draft, organizer_id=organizer.id)
+        preview = await channel.send(embed=embed, view=view)
+        draft.preview_message_id = preview.id
+        return draft
+
+    async def _open_scheduled_event_picker(self, ctx: commands.Context):
+        """Open the scheduled event picker; draft is created after selection."""
         guild: discord.Guild = ctx.guild
         scheduled: List[discord.GuildScheduledEvent] = await self._get_scheduled_events(guild, with_counts=False)
+        organizer_id = ctx.author.id
+        channel_id = ctx.channel.id
 
         outer = self
 
@@ -464,22 +544,45 @@ class DiscoOps(commands.Cog):
                     starts = ev.start_time.strftime("%Y-%m-%d %H:%M") if ev.start_time else "TBD"
                     desc = f"{starts} • {str(ev.entity_type).split('.')[-1].title()}"
                     opts.append(discord.SelectOption(label=label, description=desc[:100], value=str(ev.id)))
-                select = discord.ui.Select(placeholder="Pick a scheduled event…", options=opts, custom_id=f"evt:pick:{draft.event_id}")
+                select = discord.ui.Select(placeholder="Pick a scheduled event…", options=opts)
 
                 async def on_select(interaction: discord.Interaction):
-                    if interaction.user.id != draft.creator_id:
-                        return await interaction.response.send_message("Only the organizer can select an event for this draft.", ephemeral=True)
+                    if interaction.user.id != organizer_id:
+                        return await outer._send_ephemeral(interaction, "Only the organizer can select an event for this wizard.")
+                    await outer._defer_ephemeral(interaction)
                     ev_id = int(select.values[0])
-                    ev = discord.utils.get(self.scheduled_events, id=ev_id)
-                    await outer._hydrate_draft_from_scheduled(interaction, draft, ev)
+                    ev = await outer._resolve_scheduled_event(interaction.guild, ev_id)
+                    if not ev:
+                        return await outer._send_ephemeral(interaction, "That scheduled event is no longer available. Use **Refresh list** and try again.")
+
+                    try:
+                        ch = interaction.guild.get_channel(channel_id) or interaction.channel
+                        if not ch:
+                            raise RuntimeError("Missing channel")
+                        draft = await outer._create_draft_with_preview(
+                            guild=interaction.guild,
+                            channel=ch,
+                            organizer=interaction.user,
+                            preset_title=ev.name or "",
+                        )
+                        await outer._hydrate_draft_from_scheduled(interaction, draft, ev)
+                    except Exception as e:
+                        await outer.log_info(f"wizard import failed (dropdown): user={interaction.user.id} guild={interaction.guild.id} ev_id={ev_id} err={e!r}")
+                        await outer._send_ephemeral(interaction, "Something went wrong while importing that event. Try again (or use Paste event ID/URL).")
+
+                    try:
+                        if interaction.message:
+                            await interaction.message.edit(view=None)
+                    except Exception:
+                        pass
 
                 select.callback = on_select
                 return select
 
             @discord.ui.button(label="Refresh list", style=discord.ButtonStyle.secondary)
             async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-                if interaction.user.id != draft.creator_id:
-                    return await interaction.response.send_message("Only the organizer can refresh.", ephemeral=True)
+                if interaction.user.id != organizer_id:
+                    return await outer._send_ephemeral(interaction, "Only the organizer can refresh.")
                 new_list = await outer._get_scheduled_events(interaction.guild, with_counts=False)
                 # Create a new view instead of trying to re-add buttons
                 new_view = EventPicker(new_list if new_list else [])
@@ -487,18 +590,32 @@ class DiscoOps(commands.Cog):
 
             @discord.ui.button(label="Paste event ID/URL", style=discord.ButtonStyle.primary)
             async def paste(self, interaction: discord.Interaction, button: discord.ui.Button):
-                if interaction.user.id != draft.creator_id:
-                    return await interaction.response.send_message("Only the organizer can paste.", ephemeral=True)
-                await outer._open_paste_event_modal(interaction, draft)
+                if interaction.user.id != organizer_id:
+                    return await outer._send_ephemeral(interaction, "Only the organizer can paste.")
+                await outer._open_paste_event_modal(interaction, channel_id)
 
             @discord.ui.button(label="Create without calendar", style=discord.ButtonStyle.secondary)
             async def no_cal(self, interaction: discord.Interaction, button: discord.ui.Button):
-                if interaction.user.id != draft.creator_id:
-                    return await interaction.response.send_message("Only the organizer can continue.", ephemeral=True)
-                draft.calendar_mode = "NONE"
-                draft.linked_scheduled_event_id = None
-                await interaction.response.send_message("Continuing without linking a calendar event.", ephemeral=True)
-                await outer._open_description_modal_followup(interaction, draft)
+                if interaction.user.id != organizer_id:
+                    return await outer._send_ephemeral(interaction, "Only the organizer can continue.")
+
+                await outer._defer_ephemeral(interaction)
+                try:
+                    ch = interaction.guild.get_channel(channel_id) or interaction.channel
+                    if not ch:
+                        raise RuntimeError("Missing channel")
+                    draft = await outer._create_draft_with_preview(
+                        guild=interaction.guild,
+                        channel=ch,
+                        organizer=interaction.user,
+                    )
+                    draft.calendar_mode = "NONE"
+                    draft.linked_scheduled_event_id = None
+                    await outer._send_ephemeral(interaction, "Draft created without linking a calendar event.")
+                    await outer._open_description_modal_followup(interaction, draft)
+                except Exception as e:
+                    await outer.log_info(f"wizard create without calendar failed: user={interaction.user.id} guild={interaction.guild.id} err={e!r}")
+                    await outer._send_ephemeral(interaction, "Something went wrong creating the draft. Try again.")
 
         # Send the picker prompt
         await ctx.send(
@@ -508,7 +625,7 @@ class DiscoOps(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    async def _open_paste_event_modal(self, interaction: discord.Interaction, draft: EventDraft):
+    async def _open_paste_event_modal(self, interaction: discord.Interaction, channel_id: int):
         """Open a modal to paste an event ID or URL."""
         outer = self
 
@@ -516,38 +633,49 @@ class DiscoOps(commands.Cog):
             ev_input = discord.ui.TextInput(label="Event ID or URL", required=True, max_length=200)
 
             async def on_submit(self, inter: discord.Interaction):
-                raw = str(self.ev_input).strip()
+                await outer._defer_ephemeral(inter)
+
+                raw = (self.ev_input.value or "").strip()
                 ev_id = None
                 tokenized = raw.replace("<", "").replace(">", "").split("/")
                 for token in tokenized:
                     if token.isdigit():
                         ev_id = int(token)
                 if not ev_id:
-                    return await inter.response.send_message("Couldn't find an event ID in that input.", ephemeral=True)
+                    return await outer._send_ephemeral(inter, "Couldn't find an event ID in that input.")
+
+                ev = await outer._resolve_scheduled_event(inter.guild, ev_id)
+                if not ev:
+                    return await outer._send_ephemeral(inter, "No scheduled event with that ID.")
 
                 try:
-                    ev = await inter.guild.fetch_scheduled_event(ev_id)
-                except discord.NotFound:
-                    return await inter.response.send_message("No scheduled event with that ID.", ephemeral=True)
-
-                await outer._hydrate_draft_from_scheduled(inter, draft, ev)
+                    ch = inter.guild.get_channel(channel_id) or inter.channel
+                    if not ch:
+                        raise RuntimeError("Missing channel")
+                    draft = await outer._create_draft_with_preview(
+                        guild=inter.guild,
+                        channel=ch,
+                        organizer=inter.user,
+                        preset_title=ev.name or "",
+                    )
+                    await outer._hydrate_draft_from_scheduled(inter, draft, ev)
+                except Exception as e:
+                    await outer.log_info(f"wizard import failed (paste): user={inter.user.id} guild={inter.guild.id} ev_id={ev_id} err={e!r}")
+                    await outer._send_ephemeral(inter, "Something went wrong while importing that event. Try again.")
 
         await interaction.response.send_modal(PasteModal())
 
     async def _hydrate_draft_from_scheduled(self, interaction: discord.Interaction, draft: EventDraft, ev: discord.GuildScheduledEvent):
         """Import details from a scheduled event into the draft."""
+        await self._defer_ephemeral(interaction)
+        if not ev:
+            return await self._send_ephemeral(interaction, "That scheduled event is no longer available. Try refreshing and selecting again.")
+
         draft.calendar_mode = "LINK_EXISTING"
         draft.linked_scheduled_event_id = ev.id
         draft.title = ev.name or draft.title or "Untitled Event"
         draft.starts_at = ev.start_time
         draft.ends_at = ev.end_time
-
-        if ev.entity_type in (discord.EntityType.voice, discord.EntityType.stage_instance):
-            draft.location = ev.channel.name if ev.channel else "Voice/Stage (channel unavailable)"
-        elif ev.entity_type == discord.EntityType.external:
-            draft.location = getattr(ev.entity_metadata, "location", "External") if ev.entity_metadata else "External"
-        else:
-            draft.location = "TBD"
 
         draft.description_md = (ev.description or "").strip()
 
@@ -570,7 +698,7 @@ class DiscoOps(commands.Cog):
             "image": getattr(ev.image, "url", None) if hasattr(ev, "image") and ev.image else None,
         })
 
-        await interaction.response.send_message(f"Imported **{ev.name}** from the calendar.", ephemeral=True)
+        await self._send_ephemeral(interaction, f"Imported **{ev.name}** from the calendar.")
         await self._refresh_preview(interaction.guild, draft)
         await self._open_description_modal_followup(interaction, draft)
 
@@ -589,7 +717,7 @@ class DiscoOps(commands.Cog):
             )
 
             async def on_submit(self, inter: discord.Interaction):
-                draft.description_md = str(self.description)
+                draft.description_md = (self.description.value or "")
                 await inter.response.send_message("Description saved.", ephemeral=True)
                 await outer._refresh_preview(inter.guild, draft)
 
@@ -614,7 +742,7 @@ class DiscoOps(commands.Cog):
                     return await inter.response.send_message("Only the organizer can edit.", ephemeral=True)
                 await inter.response.send_modal(outer._create_description_modal(draft))
 
-        await interaction.followup.send("Click to edit the event description:", view=OpenModalView(), ephemeral=True)
+        await self._send_ephemeral(interaction, "Click to edit the event description:", view=OpenModalView())
 
     async def _open_roles_builder(self, interaction: discord.Interaction, draft: EventDraft):
         """Open the roles builder view."""
@@ -640,7 +768,7 @@ class DiscoOps(commands.Cog):
         summary = "No roles yet." if not draft.roles else "\n".join(
             f"• {(r.emoji + ' ') if r.emoji else ''}{r.label} ({'∞' if r.capacity is None else r.capacity})" for r in draft.roles.values()
         )
-        await interaction.followup.send(f"**Roles so far:**\n{summary}", view=RolesView(), ephemeral=True)
+        await self._send_ephemeral(interaction, f"**Roles so far:**\n{summary}", view=RolesView())
 
     async def _open_add_role_modal(self, interaction: discord.Interaction, draft: EventDraft):
         """Open a modal to add a new role option."""
@@ -654,7 +782,7 @@ class DiscoOps(commands.Cog):
 
             async def on_submit(self, inter: discord.Interaction):
                 rid = f"r{len(draft.roles)+1}"
-                cap_raw = str(self.capacity).strip()
+                cap_raw = (self.capacity.value or "").strip()
                 cap_val: Optional[int] = None
                 if cap_raw:
                     try:
@@ -663,10 +791,10 @@ class DiscoOps(commands.Cog):
                         return await inter.response.send_message("Capacity must be a number.", ephemeral=True)
                 rd = RoleDraft(
                     role_id=rid,
-                    label=str(self.label).strip(),
+                    label=(self.label.value or "").strip(),
                     capacity=cap_val,
-                    emoji=str(self.emoji).strip() or None,
-                    description=str(self.desc).strip() or None,
+                    emoji=(self.emoji.value or "").strip() or None,
+                    description=(self.desc.value or "").strip() or None,
                 )
                 draft.roles[rid] = rd
                 await inter.response.send_message(f"Added role **{rd.label}**.", ephemeral=True)
@@ -681,6 +809,22 @@ class DiscoOps(commands.Cog):
         class OptionsView(discord.ui.View):
             def __init__(self):
                 super().__init__(timeout=300)
+
+            @discord.ui.select(
+                placeholder="Comms",
+                options=[
+                    discord.SelectOption(label="Discord", value="DISCORD", default=("DISCORD" in (draft.comms or []))),
+                    discord.SelectOption(label="SRS", value="SRS", default=("SRS" in (draft.comms or []))),
+                ],
+                min_values=1,
+                max_values=2,
+            )
+            async def comms_select(self, inter: discord.Interaction, select: discord.ui.Select):
+                if inter.user.id != draft.creator_id:
+                    return await inter.response.send_message("Only the organizer can change options.", ephemeral=True)
+                draft.comms = list(select.values)
+                await inter.response.send_message(f"Comms set to **{outer._format_comms(draft)}**.", ephemeral=True)
+                await outer._refresh_preview(inter.guild, draft)
 
             @discord.ui.select(
                 placeholder="Calendar behavior",
@@ -716,10 +860,11 @@ class DiscoOps(commands.Cog):
                     return await inter.response.send_message("Only the organizer can continue.", ephemeral=True)
                 await inter.response.send_message("Options saved. Use **Publish** under the preview message when ready.", ephemeral=True)
 
-        await interaction.followup.send("Options:", view=OptionsView(), ephemeral=True)
+        await self._send_ephemeral(interaction, "Options:", view=OptionsView())
 
     async def _publish_from_draft(self, interaction: discord.Interaction, draft: EventDraft):
         """Publish the event from the draft."""
+        await self._defer_ephemeral(interaction)
         async with self._draft_lock(draft.event_id):
             # Create the canonical event message
             detailed_msg = await self._post_canonical_event(interaction.guild, draft, channel_hint=draft.draft_channel_id)
@@ -727,13 +872,14 @@ class DiscoOps(commands.Cog):
             # Optionally: sync key fields back to calendar if linked & toggle is on
             if draft.sync_back_to_calendar and draft.calendar_mode == "LINK_EXISTING" and draft.linked_scheduled_event_id:
                 try:
-                    cal = await interaction.guild.fetch_scheduled_event(draft.linked_scheduled_event_id)
-                    await cal.edit(
-                        name=draft.title or cal.name,
-                        start_time=draft.starts_at or cal.start_time,
-                        end_time=draft.ends_at or cal.end_time,
-                        description=(draft.description_md[:1000] or None)  # calendar limits
-                    )
+                    cal = await self._resolve_scheduled_event(interaction.guild, draft.linked_scheduled_event_id)
+                    if cal:
+                        await cal.edit(
+                            name=draft.title or cal.name,
+                            start_time=draft.starts_at or cal.start_time,
+                            end_time=draft.ends_at or cal.end_time,
+                            description=(draft.description_md[:1000] or None)  # calendar limits
+                        )
                 except Exception:
                     pass
 
@@ -751,7 +897,10 @@ class DiscoOps(commands.Cog):
             self._drafts.pop(draft.creator_id, None)
             draft.status = "PUBLISHED"
 
-            await interaction.response.send_message(f"Event published. Jump: {detailed_msg.jump_url}", ephemeral=True)
+            try:
+                await self._send_ephemeral(interaction, f"Event published. Jump: {detailed_msg.jump_url}")
+            except Exception:
+                pass
             await self.log_info(f"{interaction.user} published event {draft.event_id} in guild {interaction.guild.id}")
 
     async def _cancel_draft(self, interaction: discord.Interaction, draft: EventDraft):
@@ -795,7 +944,7 @@ class DiscoOps(commands.Cog):
                 when += f" → {discord.utils.format_dt(draft.ends_at, style='t')}"
         e.description = (
             f"**When:** {when}\n"
-            f"**Where:** {draft.location or 'TBD'}\n"
+            f"**Comms:** {self._format_comms(draft)}\n"
             f"{draft.description_md[:1800]}"
         )
         if draft.image_url:
@@ -1006,8 +1155,7 @@ class DiscoOps(commands.Cog):
         Usage: [p]do event create
         """
         await self.log_info(f"{ctx.author} started event wizard in guild {ctx.guild.id}")
-        draft = await self._start_wizard_with_preview(ctx)
-        await self._open_scheduled_event_picker(ctx, draft)
+        await self._open_scheduled_event_picker(ctx)
 
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
