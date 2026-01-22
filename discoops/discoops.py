@@ -50,6 +50,7 @@ class EventDraft:
     discussion_mode: str = "THREAD"   # or "CHANNEL"
     draft_channel_id: Optional[int] = None
     preview_message_id: Optional[int] = None
+    control_message_id: Optional[int] = None
     status: str = "DRAFT"
     roles: Dict[str, RoleDraft] = field(default_factory=dict)
 
@@ -63,6 +64,8 @@ class EventDraft:
     wizard_updates_message_id: Optional[int] = None
     wizard_updates: List[str] = field(default_factory=list)
     wizard_temp_message_ids: List[int] = field(default_factory=list)
+    pending_emoji_role_id: Optional[str] = None
+    divisions: List[str] = field(default_factory=list)
 
 
 class DiscoOps(commands.Cog):
@@ -358,6 +361,411 @@ class DiscoOps(commands.Cog):
         except Exception:
             pass
 
+    def _build_wizard_control_content(self, draft: EventDraft, *, mode: str) -> str:
+        title = (draft.title or "Untitled Event").strip()
+        when = "TBD"
+        try:
+            if draft.starts_at:
+                when = discord.utils.format_dt(draft.starts_at, style="F")
+                if draft.ends_at:
+                    when += f" → {discord.utils.format_dt(draft.ends_at, style='t')}"
+        except Exception:
+            pass
+
+        role_count = len(draft.roles or {})
+        mode_title = {
+            "main": "Main",
+            "roles": "Roles",
+            "options": "Options",
+            "publish": "Publish",
+        }.get(mode, mode)
+
+        lines = [
+            f"# Event Wizard Controls",
+            f"**Draft:** {title}",
+            f"**Mode:** {mode_title}",
+            f"**When:** {when}",
+            f"**Comms:** {self._format_comms(draft)}",
+            f"**Roles:** {role_count}/24",
+        ]
+        if draft.pending_emoji_role_id and draft.pending_emoji_role_id in (draft.roles or {}):
+            r = draft.roles[draft.pending_emoji_role_id]
+            if not r.emoji:
+                lines.append(f"**Emoji pending:** {self._role_display_name(r)}")
+
+        return "\n".join(lines)[:MAX_MSG]
+
+    async def _refresh_wizard_control(self, guild: discord.Guild, draft: EventDraft, *, mode: str):
+        """Edit the control panel message to reflect the latest state."""
+        try:
+            if not draft.control_message_id or not draft.draft_channel_id:
+                return
+            ch = guild.get_channel(draft.draft_channel_id)
+            if not ch:
+                return
+            try:
+                msg = await ch.fetch_message(int(draft.control_message_id))
+            except Exception:
+                return
+            content = self._build_wizard_control_content(draft, mode=mode)
+            view = self._build_wizard_control_view(draft, mode=mode)
+            await msg.edit(content=content, view=view, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            pass
+
+    def _build_wizard_control_view(self, draft: EventDraft, *, mode: str) -> discord.ui.View:
+        """Build a single in-channel control panel view (no extra bot messages)."""
+        outer = self
+
+        class ControlView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=900)
+
+            async def _check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != draft.creator_id:
+                    try:
+                        await inter.response.send_message("Only the organizer can use this wizard.", ephemeral=True)
+                    except Exception:
+                        pass
+                    return False
+                return True
+
+        view = ControlView()
+
+        # ---- main ----
+        if mode == "main":
+            btn_desc = discord.ui.Button(label="Edit Description", style=discord.ButtonStyle.primary)
+            async def on_desc(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.send_modal(self._create_description_modal(draft, return_mode="main"))
+            btn_desc.callback = on_desc
+            view.add_item(btn_desc)
+
+            btn_roles = discord.ui.Button(label="Roles", style=discord.ButtonStyle.secondary)
+            async def on_roles(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="roles"),
+                    view=outer._build_wizard_control_view(draft, mode="roles"),
+                )
+            btn_roles.callback = on_roles
+            view.add_item(btn_roles)
+
+            btn_opts = discord.ui.Button(label="Options", style=discord.ButtonStyle.secondary)
+            async def on_opts(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="options"),
+                    view=outer._build_wizard_control_view(draft, mode="options"),
+                )
+            btn_opts.callback = on_opts
+            view.add_item(btn_opts)
+
+            btn_pub = discord.ui.Button(label="Publish", style=discord.ButtonStyle.success)
+            async def on_pub(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="publish"),
+                    view=outer._build_wizard_control_view(draft, mode="publish"),
+                )
+            btn_pub.callback = on_pub
+            view.add_item(btn_pub)
+
+            btn_cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger)
+            async def on_cancel(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
+                await outer._cancel_draft(inter, draft)
+            btn_cancel.callback = on_cancel
+            view.add_item(btn_cancel)
+
+            return view
+
+        # ---- roles ----
+        if mode == "roles":
+            div_list = [str(d).strip() for d in (draft.divisions or []) if str(d).strip()]
+            if not div_list:
+                div_list = ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"]
+            # De-dup preserving order
+            seen = set()
+            div_list2 = []
+            for d in div_list:
+                k = outer._norm_text(d)
+                if k and k not in seen:
+                    seen.add(k)
+                    div_list2.append(d)
+            div_list = div_list2[:25]
+            opts = [discord.SelectOption(label=d[:100], value=d) for d in div_list]
+
+            div_select = discord.ui.Select(placeholder="Add role: pick a division…", options=opts, min_values=1, max_values=1)
+            async def on_div(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                division = div_select.values[0]
+                await inter.response.send_modal(outer._create_add_role_modal(draft, division=division, return_mode="roles"))
+            div_select.callback = on_div
+            view.add_item(div_select)
+
+            # Delete role select
+            role_opts = []
+            for rid, r in (draft.roles or {}).items():
+                label = outer._role_display_name(r)
+                role_opts.append(discord.SelectOption(label=label[:100], value=str(rid)))
+            role_opts = role_opts[:25]
+            if role_opts:
+                del_select = discord.ui.Select(placeholder="Delete a role…", options=role_opts, min_values=1, max_values=1)
+                async def on_del(inter: discord.Interaction):
+                    if not await view._check(inter):
+                        return
+                    rid = del_select.values[0]
+                    if rid in draft.roles:
+                        r = draft.roles[rid]
+                        disp = outer._role_display_name(r)
+                        del draft.roles[rid]
+                        if draft.pending_emoji_role_id == rid:
+                            draft.pending_emoji_role_id = None
+                        await outer._refresh_preview(inter.guild, draft)
+                        await inter.response.edit_message(
+                            content=outer._build_wizard_control_content(draft, mode="roles"),
+                            view=outer._build_wizard_control_view(draft, mode="roles"),
+                        )
+                del_select.callback = on_del
+                view.add_item(del_select)
+
+            # Pending emoji
+            if draft.pending_emoji_role_id and draft.pending_emoji_role_id in (draft.roles or {}):
+                target = draft.roles[draft.pending_emoji_role_id]
+                if not target.emoji:
+                    btn_set = discord.ui.Button(label=f"Set Emoji: {outer._role_display_name(target)}", style=discord.ButtonStyle.secondary)
+
+                    async def on_set(inter: discord.Interaction):
+                        if not await view._check(inter):
+                            return
+                        await inter.response.send_modal(outer._create_set_emoji_modal(draft, role_id=draft.pending_emoji_role_id, return_mode="roles"))
+
+                    btn_set.callback = on_set
+                    view.add_item(btn_set)
+
+                    btn_skip = discord.ui.Button(label="Skip Emoji", style=discord.ButtonStyle.secondary)
+                    async def on_skip(inter: discord.Interaction):
+                        if not await view._check(inter):
+                            return
+                        draft.pending_emoji_role_id = None
+                        await outer._refresh_preview(inter.guild, draft)
+                        await inter.response.edit_message(
+                            content=outer._build_wizard_control_content(draft, mode="roles"),
+                            view=outer._build_wizard_control_view(draft, mode="roles"),
+                        )
+                    btn_skip.callback = on_skip
+                    view.add_item(btn_skip)
+
+            btn_back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+            async def on_back(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="main"),
+                    view=outer._build_wizard_control_view(draft, mode="main"),
+                )
+            btn_back.callback = on_back
+            view.add_item(btn_back)
+            return view
+
+        # ---- options ----
+        if mode == "options":
+            comms_opts = [
+                discord.SelectOption(label="Discord", value="DISCORD", default=("DISCORD" in (draft.comms or []))),
+                discord.SelectOption(label="SRS", value="SRS", default=("SRS" in (draft.comms or []))),
+            ]
+            comms_select = discord.ui.Select(placeholder="Comms", options=comms_opts, min_values=1, max_values=2)
+            async def on_comms(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                draft.comms = list(comms_select.values)
+                await outer._refresh_preview(inter.guild, draft)
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="options"),
+                    view=outer._build_wizard_control_view(draft, mode="options"),
+                )
+            comms_select.callback = on_comms
+            view.add_item(comms_select)
+
+            cal_opts = [
+                discord.SelectOption(label="Link existing", value="LINK_EXISTING", default=(draft.calendar_mode == "LINK_EXISTING")),
+                discord.SelectOption(label="No calendar", value="NONE", default=(draft.calendar_mode == "NONE")),
+            ]
+            cal_select = discord.ui.Select(placeholder="Calendar behavior", options=cal_opts, min_values=1, max_values=1)
+            async def on_cal(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                draft.calendar_mode = cal_select.values[0]
+                if draft.calendar_mode != "LINK_EXISTING":
+                    draft.linked_scheduled_event_id = None
+                await outer._refresh_preview(inter.guild, draft)
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="options"),
+                    view=outer._build_wizard_control_view(draft, mode="options"),
+                )
+            cal_select.callback = on_cal
+            view.add_item(cal_select)
+
+            sync_btn = discord.ui.Button(
+                label=("Sync edits to calendar: ON" if draft.sync_back_to_calendar else "Sync edits to calendar: OFF"),
+                style=discord.ButtonStyle.secondary,
+            )
+            async def on_sync(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                draft.sync_back_to_calendar = not draft.sync_back_to_calendar
+                await outer._refresh_preview(inter.guild, draft)
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="options"),
+                    view=outer._build_wizard_control_view(draft, mode="options"),
+                )
+            sync_btn.callback = on_sync
+            view.add_item(sync_btn)
+
+            btn_back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+            async def on_back(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="main"),
+                    view=outer._build_wizard_control_view(draft, mode="main"),
+                )
+            btn_back.callback = on_back
+            view.add_item(btn_back)
+            return view
+
+        # ---- publish ----
+        if mode == "publish":
+            guild = outer.bot.get_guild(draft.guild_id)
+            if not guild:
+                back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+                async def on_back(inter: discord.Interaction):
+                    if not await view._check(inter):
+                        return
+                    await inter.response.edit_message(
+                        content=outer._build_wizard_control_content(draft, mode="main"),
+                        view=outer._build_wizard_control_view(draft, mode="main"),
+                    )
+                back.callback = on_back
+                view.add_item(back)
+                return view
+
+            me = getattr(guild, "me", None)
+            eligible = []
+            for ch in getattr(guild, "text_channels", []) or []:
+                try:
+                    perms = ch.permissions_for(me) if me else None
+                    if not perms:
+                        continue
+                    if not (perms.view_channel and perms.send_messages and perms.read_message_history):
+                        continue
+                    eligible.append(ch)
+                except Exception:
+                    continue
+
+            by_cat: Dict[str, List[discord.TextChannel]] = {}
+            for ch in eligible:
+                key = str(ch.category_id) if ch.category_id else "none"
+                by_cat.setdefault(key, []).append(ch)
+            for k in by_cat:
+                by_cat[k].sort(key=lambda c: c.position)
+
+            cat_opts = []
+            for cat in sorted(getattr(guild, "categories", []) or [], key=lambda c: c.position):
+                if str(cat.id) in by_cat:
+                    cat_opts.append(discord.SelectOption(label=cat.name[:100], value=str(cat.id)))
+            if "none" in by_cat:
+                cat_opts.append(discord.SelectOption(label="No Category", value="none"))
+            cat_opts = cat_opts[:25]
+
+            # If too many categories/channels exist, user can still use the Search button on the list
+            # command or temporarily move channels into a category.
+
+            # Create selects
+            cat_select = discord.ui.Select(placeholder="Pick a category…", options=cat_opts, min_values=1, max_values=1)
+            chan_select = discord.ui.Select(placeholder="Pick a channel…", options=[], min_values=1, max_values=1, disabled=True)
+            pub_btn = discord.ui.Button(label="Publish Now", style=discord.ButtonStyle.success, disabled=True)
+            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+
+            state = {"cat": None, "chan": None}
+
+            async def on_cat(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                state["cat"] = cat_select.values[0]
+                chans = by_cat.get(str(state["cat"]), [])
+                opts = []
+                for c in chans[:25]:
+                    label = ("#" + c.name)[:100]
+                    desc = (c.category.name if c.category else "No Category")[:100]
+                    opts.append(discord.SelectOption(label=label, value=str(c.id), description=desc))
+                chan_select.options = opts
+                chan_select.disabled = not bool(opts)
+                state["chan"] = None
+                pub_btn.disabled = True
+                await inter.response.edit_message(view=view)
+
+            async def on_chan(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                state["chan"] = chan_select.values[0]
+                pub_btn.disabled = False
+                await inter.response.edit_message(view=view)
+
+            async def on_publish_click(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                if not state.get("chan"):
+                    return await inter.response.send_message("Pick a channel first.", ephemeral=True)
+                try:
+                    await inter.response.defer(thinking=True)
+                except Exception:
+                    pass
+                await outer._publish_to_channel(inter, draft, channel_id=int(state["chan"]))
+
+            async def on_back(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                await inter.response.edit_message(
+                    content=outer._build_wizard_control_content(draft, mode="main"),
+                    view=outer._build_wizard_control_view(draft, mode="main"),
+                )
+
+            cat_select.callback = on_cat
+            chan_select.callback = on_chan
+            pub_btn.callback = on_publish_click
+            back_btn.callback = on_back
+
+            view.add_item(cat_select)
+            view.add_item(chan_select)
+            view.add_item(pub_btn)
+            view.add_item(back_btn)
+            return view
+
+        # Fallback
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+        async def on_back(inter: discord.Interaction):
+            if not await view._check(inter):
+                return
+            await inter.response.edit_message(
+                content=outer._build_wizard_control_content(draft, mode="main"),
+                view=outer._build_wizard_control_view(draft, mode="main"),
+            )
+        back.callback = on_back
+        view.add_item(back)
+        return view
+
     async def _wizard_note_change(self, guild: discord.Guild, draft: EventDraft, line: str):
         """Maintain a single editable 'wizard updates' message.
 
@@ -644,12 +1052,11 @@ class DiscoOps(commands.Cog):
         if not channel:
             return
         embed = self._build_preview_embed(draft)
-        view = self._build_preview_controls(draft, organizer_id=draft.creator_id)
         try:
             msg = await channel.fetch_message(draft.preview_message_id)
-            await msg.edit(embed=embed, view=view)
+            await msg.edit(embed=embed, view=None)
         except discord.NotFound:
-            new_msg = await channel.send(embed=embed, view=view)
+            new_msg = await channel.send(embed=embed, view=None)
             draft.preview_message_id = new_msg.id
 
     async def _start_wizard_with_preview(self, ctx: commands.Context, preset_title: Optional[str] = None) -> EventDraft:
@@ -664,10 +1071,22 @@ class DiscoOps(commands.Cog):
         )
         self._drafts[ctx.author.id] = draft
 
+        # Snapshot divisions for this wizard run
+        try:
+            divs = await self.config.guild(ctx.guild).wizard_divisions()
+            draft.divisions = [str(d).strip() for d in (divs or []) if str(d).strip()]
+        except Exception:
+            draft.divisions = ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"]
+
         embed = self._build_preview_embed(draft)
-        view = self._build_preview_controls(draft, organizer_id=ctx.author.id)
-        preview = await ctx.channel.send(embed=embed, view=view)
+        preview = await ctx.channel.send(embed=embed, view=None)
         draft.preview_message_id = preview.id
+
+        # Control panel message (single message that changes as you navigate)
+        ctrl_content = self._build_wizard_control_content(draft, mode="main")
+        ctrl_view = self._build_wizard_control_view(draft, mode="main")
+        ctrl = await ctx.channel.send(ctrl_content, view=ctrl_view, allowed_mentions=discord.AllowedMentions.none())
+        draft.control_message_id = ctrl.id
         return draft
 
     async def _resolve_scheduled_event(self, guild: discord.Guild, ev_id: int) -> Optional[discord.GuildScheduledEvent]:
@@ -701,10 +1120,20 @@ class DiscoOps(commands.Cog):
             title=preset_title or "",
         )
         self._drafts[organizer.id] = draft
+
+        try:
+            divs = await self.config.guild(guild).wizard_divisions()
+            draft.divisions = [str(d).strip() for d in (divs or []) if str(d).strip()]
+        except Exception:
+            draft.divisions = ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"]
         embed = self._build_preview_embed(draft)
-        view = self._build_preview_controls(draft, organizer_id=organizer.id)
-        preview = await channel.send(embed=embed, view=view)
+        preview = await channel.send(embed=embed, view=None)
         draft.preview_message_id = preview.id
+
+        ctrl_content = self._build_wizard_control_content(draft, mode="main")
+        ctrl_view = self._build_wizard_control_view(draft, mode="main")
+        ctrl = await channel.send(ctrl_content, view=ctrl_view, allowed_mentions=discord.AllowedMentions.none())
+        draft.control_message_id = ctrl.id
         return draft
 
     async def _open_scheduled_event_picker(self, ctx: commands.Context):
@@ -797,8 +1226,8 @@ class DiscoOps(commands.Cog):
                     )
                     draft.calendar_mode = "NONE"
                     draft.linked_scheduled_event_id = None
-                    await outer._send_ephemeral(interaction, "Draft created without linking a calendar event.")
-                    await outer._open_description_modal_followup(interaction, draft)
+                    await outer._refresh_preview(interaction.guild, draft)
+                    await outer._refresh_wizard_control(interaction.guild, draft, mode="main")
                 except Exception as e:
                     await outer.log_info(f"wizard create without calendar failed: user={interaction.user.id} guild={interaction.guild.id} err={e!r}")
                     await outer._send_ephemeral(interaction, "Something went wrong creating the draft. Try again.")
@@ -906,15 +1335,17 @@ class DiscoOps(commands.Cog):
             "image": getattr(ev.image, "url", None) if hasattr(ev, "image") and ev.image else None,
         })
 
-        await self._send_ephemeral(interaction, f"Imported **{ev.name}** from the calendar.")
         await self._refresh_preview(interaction.guild, draft)
-        await self._open_description_modal_followup(interaction, draft)
+        await self._refresh_wizard_control(interaction.guild, draft, mode="main")
 
-    def _create_description_modal(self, draft: EventDraft):
+    def _create_description_modal(self, draft: EventDraft, *, return_mode: str = "main"):
         """Create a description modal for the given draft."""
         outer = self
 
-        class DescriptionModal(discord.ui.Modal, title="Event Description"):
+        class DescriptionModal(discord.ui.Modal):
+            def __init__(self):
+                super().__init__(title="Event Description")
+
             description = discord.ui.TextInput(
                 label="Long description (markdown ok)",
                 style=discord.TextStyle.long,
@@ -926,14 +1357,18 @@ class DiscoOps(commands.Cog):
 
             async def on_submit(self, inter: discord.Interaction):
                 draft.description_md = (self.description.value or "")
-                await inter.response.send_message("Description saved.", ephemeral=True)
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
                 await outer._refresh_preview(inter.guild, draft)
+                await outer._refresh_wizard_control(inter.guild, draft, mode=return_mode)
 
         return DescriptionModal()
 
     async def _open_description_modal(self, interaction: discord.Interaction, draft: EventDraft):
         """Open the description editing modal (as response)."""
-        await interaction.response.send_modal(self._create_description_modal(draft))
+        await interaction.response.send_modal(self._create_description_modal(draft, return_mode="main"))
 
     async def _open_description_modal_followup(self, interaction: discord.Interaction, draft: EventDraft):
         """Open the description editing modal (as followup after another response)."""
@@ -948,7 +1383,7 @@ class DiscoOps(commands.Cog):
             async def open_modal(self, inter: discord.Interaction, button: discord.ui.Button):
                 if inter.user.id != draft.creator_id:
                     return await inter.response.send_message("Only the organizer can edit.", ephemeral=True)
-                await inter.response.send_modal(outer._create_description_modal(draft))
+                await inter.response.send_modal(outer._create_description_modal(draft, return_mode="main"))
 
         await self._send_ephemeral(interaction, "Click to edit the event description:", view=OpenModalView())
 
@@ -1012,12 +1447,15 @@ class DiscoOps(commands.Cog):
 
         await self._send_ephemeral(interaction, "Select the division for the new role:", view=DivisionPickView())
 
-    def _create_add_role_modal(self, draft: EventDraft, *, division: str) -> discord.ui.Modal:
+    def _create_add_role_modal(self, draft: EventDraft, *, division: str, return_mode: str = "roles") -> discord.ui.Modal:
         """Step 2: enter role name + capacity."""
         outer = self
         division = (division or "").strip()
 
-        class AddRoleModal(discord.ui.Modal, title="Add Division Role"):
+        class AddRoleModal(discord.ui.Modal):
+            def __init__(self):
+                super().__init__(title="Add Division Role")
+
             role_name = discord.ui.TextInput(label=f"Role in {division}", required=True, max_length=50)
             capacity = discord.ui.TextInput(label="Capacity (blank = unlimited)", required=False, max_length=6)
 
@@ -1055,62 +1493,43 @@ class DiscoOps(commands.Cog):
                     capacity=cap_val,
                 )
                 draft.roles[rid] = rd
+                draft.pending_emoji_role_id = rid
 
                 disp = outer._role_display_name(rd)
-                await inter.response.send_message(
-                    f"Added role **{disp}**. Next: react to the emoji prompt in the channel (or ignore to skip).",
-                    ephemeral=True,
-                )
                 try:
-                    await outer._wizard_note_change(
-                        inter.guild,
-                        draft,
-                        f"Role added: {disp} ({'∞' if rd.capacity is None else rd.capacity})",
-                    )
-                except Exception:
-                    pass
-
-                # Emoji picker via reaction (native emoji picker UX)
-                try:
-                    ch = inter.guild.get_channel(draft.draft_channel_id) if draft.draft_channel_id else inter.channel
-                    if ch:
-                        prompt = await ch.send(
-                            f"Pick an emoji for **{disp}** by reacting to this message (timeout: 60s).",
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                        try:
-                            if prompt.id not in draft.wizard_temp_message_ids:
-                                draft.wizard_temp_message_ids.append(prompt.id)
-                        except Exception:
-                            pass
-
-                        def check(reaction: discord.Reaction, user: discord.User):
-                            try:
-                                return user.id == draft.creator_id and reaction.message.id == prompt.id
-                            except Exception:
-                                return False
-
-                        try:
-                            reaction, _user = await outer.bot.wait_for("reaction_add", timeout=60.0, check=check)
-                            emoji_str = str(reaction.emoji) if reaction and reaction.emoji else None
-                            if emoji_str:
-                                rd.emoji = emoji_str
-                                draft.roles[rid] = rd
-                                await outer._wizard_note_change(inter.guild, draft, f"Role emoji set: {disp} = {emoji_str}")
-                        except asyncio.TimeoutError:
-                            pass
-                        except Exception:
-                            pass
-                        try:
-                            await prompt.delete()
-                        except Exception:
-                            pass
+                    await inter.response.defer()
                 except Exception:
                     pass
 
                 await outer._refresh_preview(inter.guild, draft)
+                await outer._refresh_wizard_control(inter.guild, draft, mode=return_mode)
 
         return AddRoleModal()
+
+    def _create_set_emoji_modal(self, draft: EventDraft, *, role_id: str, return_mode: str = "roles") -> discord.ui.Modal:
+        outer = self
+        role_id = str(role_id or "")
+
+        class SetEmojiModal(discord.ui.Modal):
+            def __init__(self):
+                super().__init__(title="Set Role Emoji")
+
+            emoji = discord.ui.TextInput(label="Emoji", required=True, max_length=64, placeholder="React emoji or custom emoji")
+
+            async def on_submit(self, inter: discord.Interaction):
+                e = (self.emoji.value or "").strip()
+                if role_id in (draft.roles or {}):
+                    draft.roles[role_id].emoji = e or None
+                if draft.pending_emoji_role_id == role_id:
+                    draft.pending_emoji_role_id = None
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
+                await outer._refresh_preview(inter.guild, draft)
+                await outer._refresh_wizard_control(inter.guild, draft, mode=return_mode)
+
+        return SetEmojiModal()
 
     async def _open_options_view(self, interaction: discord.Interaction, draft: EventDraft):
         """Open the options configuration view."""
@@ -1211,6 +1630,8 @@ class DiscoOps(commands.Cog):
             ids = set()
             if draft.preview_message_id:
                 ids.add(int(draft.preview_message_id))
+            if draft.control_message_id:
+                ids.add(int(draft.control_message_id))
             if draft.wizard_updates_message_id:
                 ids.add(int(draft.wizard_updates_message_id))
             for mid in (draft.wizard_temp_message_ids or []):
@@ -1451,7 +1872,7 @@ class DiscoOps(commands.Cog):
         """Cancel and delete the draft."""
         await self._cleanup_wizard_messages(interaction.guild, draft)
         self._drafts.pop(draft.creator_id, None)
-        await interaction.response.send_message("Draft canceled and preview removed.", ephemeral=True)
+        await self._send_ephemeral(interaction, "Draft canceled.")
         await self.log_info(f"{interaction.user} canceled draft {draft.event_id} in guild {interaction.guild.id}")
 
     async def _post_canonical_event(self, guild: discord.Guild, draft: EventDraft, channel_hint: Optional[int] = None) -> discord.Message:
