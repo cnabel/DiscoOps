@@ -11,7 +11,7 @@ Notes:
 ## Command Overview
 
 Base group:
-- `[p]do` (alias: `[p]discoops`)
+- `[p]do` (alias: `[p]discoops`) — with no arguments, opens the **interactive hub**
 
 Help:
 - `[p]do help`
@@ -19,6 +19,13 @@ Help:
 Members:
 - `[p]do members new <amount> <days|weeks|months>`
 - `[p]do members role <role>`
+
+Activity:
+- `[p]do activity` (alias: `act`) — 7-day overview
+- `[p]do activity top [days] [count]`
+- `[p]do activity user <member> [days]`
+- `[p]do activity voice`
+- `[p]do activity toggle`
 
 Events (Discord Scheduled Events):
 - `[p]do event ...` (alias: `[p]do events ...`)
@@ -33,6 +40,28 @@ Owner-only:
 - `[p]do logs [count]`
 - `[p]do debug`
 - `[p]do clearlogs`
+
+## The Hub
+
+```text
+[p]do
+```
+
+Opens a single interactive menu message with three sections:
+
+- **Events** — pick a scheduled event from a dropdown, then view details or
+  create/sync/delete its attendee role; list all events; start the detailed
+  event post wizard.
+- **Members** — "New Joins…" opens a form (amount + period); a role dropdown
+  lists everyone holding the chosen role.
+- **Activity** — engagement overview, leaderboards, live voice snapshot, a
+  member dropdown for individual stats, and the tracking on/off toggle.
+
+Notes:
+- Only the person who opened the hub can use its controls; anyone else gets a
+  hint to run `[p]do` themselves.
+- Reports are posted to the channel, same output as the text commands.
+- The hub times out after 15 minutes; run `[p]do` again for a fresh one.
 
 ## Members
 
@@ -68,6 +97,62 @@ Examples:
 
 Behavior:
 - Lists members in chunks and includes basic role metadata (created date, position, mentionable, color).
+
+## Activity
+
+### Overview
+
+```text
+[p]do activity
+```
+
+7-day engagement summary: total messages, voice time, engaged member counts,
+who is in voice right now, and top-5 lists for text and voice.
+
+### Leaderboards
+
+```text
+[p]do activity top [days] [count]
+```
+
+Most active members by messages and by voice time. `days` is clamped to
+1..35 (retention window), `count` to 1..25. Defaults: 7 days, top 10.
+
+### Per-Member Stats
+
+```text
+[p]do activity user <member> [days]
+```
+
+Messages, voice time, active-day count, last active date, and current voice
+channel for one member. Default window: 30 days.
+
+### Live Voice Snapshot
+
+```text
+[p]do activity voice
+```
+
+Lists everyone currently in a voice channel, grouped by channel.
+
+### Toggle Tracking
+
+```text
+[p]do activity toggle
+```
+
+Turns tracking on/off per server (on by default). Turning it off also closes
+any open voice sessions without crediting further time.
+
+Behavior and privacy:
+- Only counters are stored: per member per day, message count and voice
+  seconds. Message content is never read beyond incrementing a counter.
+- Counters buffer in memory and flush to the cog's config once a minute, so
+  busy servers don't cause constant disk writes. Data older than 35 days is
+  pruned automatically.
+- Time in the server's AFK channel is not counted. Bots are ignored.
+- Members already in voice when the cog loads are picked up within a minute
+  (the flush loop adopts untracked voice sessions).
 
 ## Events (Scheduled Events)
 
@@ -229,5 +314,6 @@ Then copy the event name exactly (partial matches usually work, but can be ambig
 
 ## Data / Privacy
 
-- Stores only per-guild mappings of scheduled event IDs to role IDs (for the event role feature).
-- Does not store personal user data persistently.
+- Stores per-guild mappings of scheduled event IDs to role IDs (for the event role feature).
+- Stores published event post data including signups (user ID → chosen role).
+- Activity tracking stores per-member daily counters (message count, voice seconds) for up to 35 days. No message content is ever stored. Tracking can be disabled per server with `[p]do activity toggle`.

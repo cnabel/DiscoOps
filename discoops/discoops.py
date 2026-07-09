@@ -6,6 +6,7 @@ from redbot.core import commands, Config
 from redbot.core.data_manager import cog_data_path
 from datetime import datetime, timedelta, timezone
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 import unicodedata
@@ -16,6 +17,9 @@ MAX_MSG = 1900  # stay safely below Discord's 2000 char limit
 MAX_LOG_BYTES = 1_000_000  # 1 MB cap for on-disk log
 MAX_LOG_DAYS = 14          # delete entries older than 14 days
 CLEANUP_EVERY_WRITES = 50  # run time-based cleanup every N writes
+
+ACTIVITY_FLUSH_SECS = 60       # batch activity counters to config this often
+ACTIVITY_RETENTION_DAYS = 35   # keep daily activity buckets this long
 
 
 # --- Data models for Detailed Events Wizard ---
@@ -76,6 +80,9 @@ class DiscoOps(commands.Cog):
             "event_roles": {},  # Maps scheduled_event_id(str) -> role_id
             "event_posts": {},  # Maps wizard_event_id(str) -> published post data + signups
             "wizard_divisions": ["Hugin", "Munin", "Faffne", "Fenrir", "Idun"],
+            "activity_enabled": True,
+            # Daily engagement buckets: {"YYYY-MM-DD": {uid(str): [messages, voice_seconds]}}
+            "activity_daily": {},
         }
         self.config.register_guild(**default_guild)
 
@@ -89,6 +96,22 @@ class DiscoOps(commands.Cog):
         # Detailed Events wizard storage
         self._drafts: Dict[int, EventDraft] = {}   # key: organizer user id -> EventDraft
         self._draft_locks: Dict[str, asyncio.Lock] = {}  # key: event_id -> lock
+
+        # Activity tracking: counters buffer in memory and flush to config
+        # periodically so busy servers don't cause a config write per message.
+        # buffer: guild_id -> date str -> uid str -> [messages, voice_seconds]
+        self._act_buf: Dict[int, Dict[str, Dict[str, List[int]]]] = {}
+        self._voice_joined: Dict[tuple, float] = {}  # (guild_id, user_id) -> time.time()
+        self._act_enabled_cache: Dict[int, bool] = {}
+        self._act_flush_task = asyncio.create_task(self._activity_flush_loop())
+
+    async def cog_unload(self):
+        """Stop the flush loop and persist any buffered activity."""
+        self._act_flush_task.cancel()
+        try:
+            await self._activity_flush()
+        except Exception:
+            pass
 
     # --------- disk logger ----------
     async def log_info(self, message: str):
@@ -1007,12 +1030,19 @@ class DiscoOps(commands.Cog):
         draft.control_message_id = ctrl.id
         return draft
 
-    async def _open_scheduled_event_picker(self, ctx: commands.Context):
-        """Open the scheduled event picker; draft is created after selection."""
-        guild: discord.Guild = ctx.guild
+    async def _open_scheduled_event_picker(
+        self,
+        dest: discord.abc.Messageable,
+        guild: discord.Guild,
+        organizer_id: int,
+        channel_id: int,
+    ):
+        """Open the scheduled event picker; draft is created after selection.
+
+        `dest` is anything with .send (Context or channel) so both the prefix
+        command and the hub can launch the wizard.
+        """
         scheduled: List[discord.GuildScheduledEvent] = await self._get_scheduled_events(guild, with_counts=False)
-        organizer_id = ctx.author.id
-        channel_id = ctx.channel.id
 
         outer = self
 
@@ -1104,7 +1134,7 @@ class DiscoOps(commands.Cog):
                     await outer._send_ephemeral(interaction, "Something went wrong creating the draft. Try again.")
 
         # Send the picker prompt
-        await ctx.send(
+        await dest.send(
             "Select a scheduled event to import details:",
             view=EventPicker(scheduled),
             delete_after=300,
@@ -1724,15 +1754,599 @@ class DiscoOps(commands.Cog):
         msg = f"# {title}\n\n{desc}"[:MAX_MSG]
         await self._send_ephemeral(interaction, msg)
 
+    # ========== Activity Tracking ==========
+
+    def _act_bump(self, guild_id: int, user_id: int, *, msgs: int = 0, voice: int = 0):
+        """Add counts to the in-memory buffer (pure dict ops, no I/O)."""
+        date_key = datetime.now(timezone.utc).date().isoformat()
+        day = self._act_buf.setdefault(guild_id, {}).setdefault(date_key, {})
+        cur = day.setdefault(str(user_id), [0, 0])
+        cur[0] += msgs
+        cur[1] += voice
+
+    async def _activity_enabled(self, guild: discord.Guild) -> bool:
+        gid = guild.id
+        if gid not in self._act_enabled_cache:
+            try:
+                self._act_enabled_cache[gid] = bool(await self.config.guild(guild).activity_enabled())
+            except Exception:
+                self._act_enabled_cache[gid] = True
+        return self._act_enabled_cache[gid]
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Count text engagement. Only counters are stored — never content."""
+        try:
+            if not message.guild or message.author.bot:
+                return
+            if not await self._activity_enabled(message.guild):
+                return
+            self._act_bump(message.guild.id, message.author.id, msgs=1)
+        except Exception:
+            pass
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        """Track time spent in voice channels (AFK channel doesn't count)."""
+        try:
+            if member.bot or not member.guild:
+                return
+            if not await self._activity_enabled(member.guild):
+                return
+            afk = member.guild.afk_channel
+            was_active = before.channel is not None and before.channel != afk
+            is_active = after.channel is not None and after.channel != afk
+            key = (member.guild.id, member.id)
+            now = time.time()
+            if is_active:
+                # Joining (or moving between) tracked channels: keep one open session.
+                self._voice_joined.setdefault(key, now)
+            elif was_active:
+                joined = self._voice_joined.pop(key, None)
+                if joined is not None:
+                    elapsed = int(now - joined)
+                    if elapsed > 0:
+                        self._act_bump(member.guild.id, member.id, voice=elapsed)
+        except Exception:
+            pass
+
+    async def _activity_flush_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(ACTIVITY_FLUSH_SECS)
+                try:
+                    await self._activity_flush()
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    async def _activity_flush(self):
+        """Credit open voice sessions, then persist buffered counters."""
+        now = time.time()
+
+        # Credit ongoing voice sessions up to now and restart their clocks, so
+        # long sessions accrue continuously and survive an unclean shutdown.
+        for key, joined in list(self._voice_joined.items()):
+            elapsed = int(now - joined)
+            if elapsed > 0:
+                self._act_bump(key[0], key[1], voice=elapsed)
+                self._voice_joined[key] = now
+
+        # Self-heal: adopt members already in voice that we have no session for
+        # (e.g. they joined before the cog loaded or after a restart).
+        for guild in getattr(self.bot, "guilds", []) or []:
+            try:
+                if not await self._activity_enabled(guild):
+                    continue
+                afk = guild.afk_channel
+                for ch in guild.voice_channels:
+                    if ch == afk:
+                        continue
+                    for m in ch.members:
+                        if m.bot:
+                            continue
+                        self._voice_joined.setdefault((guild.id, m.id), now)
+            except Exception:
+                continue
+
+        if not self._act_buf:
+            return
+        buf, self._act_buf = self._act_buf, {}
+
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=ACTIVITY_RETENTION_DAYS)).isoformat()
+        for gid, days in buf.items():
+            try:
+                async with self.config.guild_from_id(gid).activity_daily() as store:
+                    for date_key, users in days.items():
+                        day = store.setdefault(date_key, {})
+                        for uid, (dm, dv) in users.items():
+                            cur = day.get(uid) or [0, 0]
+                            day[uid] = [int(cur[0]) + dm, int(cur[1]) + dv]
+                    # Retention: ISO dates compare lexicographically.
+                    for date_key in [d for d in store if d < cutoff]:
+                        del store[date_key]
+            except Exception:
+                continue
+
+    @staticmethod
+    def _fmt_duration(seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m = rem // 60
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m"
+        return f"{seconds}s"
+
+    def _activity_window(self, guild_id: int, store: dict, days: int) -> Dict[str, List[int]]:
+        """Aggregate per-user [msgs, voice_secs] over the last N days,
+        including counts still sitting in the unflushed buffer."""
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=max(1, days) - 1)).isoformat()
+        totals: Dict[str, List[int]] = {}
+
+        def merge(day_data: dict):
+            for uid, vals in (day_data or {}).items():
+                try:
+                    dm, dv = int(vals[0]), int(vals[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                cur = totals.setdefault(str(uid), [0, 0])
+                cur[0] += dm
+                cur[1] += dv
+
+        for date_key, day_data in (store or {}).items():
+            if date_key >= cutoff:
+                merge(day_data)
+        for date_key, day_data in self._act_buf.get(guild_id, {}).items():
+            if date_key >= cutoff:
+                merge(day_data)
+        return totals
+
+    def _display_user(self, guild: discord.Guild, uid: str) -> str:
+        member = guild.get_member(int(uid))
+        if member:
+            return f"{member.mention} ({member.display_name})"
+        return f"`{uid}` (left server)"
+
+    async def _activity_overview_report(self, dest, guild: discord.Guild, days: int = 7):
+        """Summary of engagement over the last N days."""
+        store = await self.config.guild(guild).activity_daily()
+        totals = self._activity_window(guild.id, store, days)
+
+        total_msgs = sum(v[0] for v in totals.values())
+        total_voice = sum(v[1] for v in totals.values())
+        text_users = sum(1 for v in totals.values() if v[0] > 0)
+        voice_users = sum(1 for v in totals.values() if v[1] > 0)
+        in_voice_now = sum(
+            len([m for m in ch.members if not m.bot])
+            for ch in guild.voice_channels
+            if ch != guild.afk_channel
+        )
+
+        header = f"# Server Activity — last {days} days"
+        summary = (
+            f"> **Messages:** {total_msgs} from **{text_users}** members\n"
+            f"> **Voice time:** {self._fmt_duration(total_voice)} from **{voice_users}** members\n"
+            f"> **Engaged members (text or voice):** {len([v for v in totals.values() if v[0] or v[1]])}\n"
+            f"> **In voice right now:** {in_voice_now}"
+        )
+        sections = [summary]
+
+        top_text = sorted(totals.items(), key=lambda kv: kv[1][0], reverse=True)[:5]
+        top_text = [(u, v) for u, v in top_text if v[0] > 0]
+        if top_text:
+            lines = [f"{i}. {self._display_user(guild, u)} — {v[0]} messages" for i, (u, v) in enumerate(top_text, 1)]
+            sections.append("## Top text\n" + "\n".join(lines))
+
+        top_voice = sorted(totals.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
+        top_voice = [(u, v) for u, v in top_voice if v[1] > 0]
+        if top_voice:
+            lines = [f"{i}. {self._display_user(guild, u)} — {self._fmt_duration(v[1])}" for i, (u, v) in enumerate(top_voice, 1)]
+            sections.append("## Top voice\n" + "\n".join(lines))
+
+        if not top_text and not top_voice:
+            sections.append("## No activity recorded yet\n> Tracking starts when members send messages or join voice after the cog loads.")
+
+        await self._send_paginated(dest, sections, header=header)
+
+    async def _activity_top_report(self, dest, guild: discord.Guild, days: int = 7, count: int = 10):
+        """Leaderboards over the last N days."""
+        days = max(1, min(int(days), ACTIVITY_RETENTION_DAYS))
+        count = max(1, min(int(count), 25))
+        store = await self.config.guild(guild).activity_daily()
+        totals = self._activity_window(guild.id, store, days)
+
+        header = f"# Most Active Members — last {days} days"
+        sections = []
+
+        top_text = [(u, v) for u, v in sorted(totals.items(), key=lambda kv: kv[1][0], reverse=True) if v[0] > 0][:count]
+        sections.append(
+            "## By messages\n" + ("\n".join(
+                f"{i}. {self._display_user(guild, u)} — {v[0]} messages" for i, (u, v) in enumerate(top_text, 1)
+            ) if top_text else "> None recorded")
+        )
+
+        top_voice = [(u, v) for u, v in sorted(totals.items(), key=lambda kv: kv[1][1], reverse=True) if v[1] > 0][:count]
+        sections.append(
+            "## By voice time\n" + ("\n".join(
+                f"{i}. {self._display_user(guild, u)} — {self._fmt_duration(v[1])}" for i, (u, v) in enumerate(top_voice, 1)
+            ) if top_voice else "> None recorded")
+        )
+
+        await self._send_paginated(dest, sections, header=header)
+
+    async def _activity_user_report(self, dest, guild: discord.Guild, member: discord.Member, days: int = 30):
+        """Engagement stats for one member."""
+        days = max(1, min(int(days), ACTIVITY_RETENTION_DAYS))
+        store = await self.config.guild(guild).activity_daily()
+        uid = str(member.id)
+
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+        msgs = voice = 0
+        active_days = set()
+        last_active = None
+        for date_key, day_data in (store or {}).items():
+            vals = (day_data or {}).get(uid)
+            if not vals:
+                continue
+            if date_key >= cutoff:
+                try:
+                    msgs += int(vals[0])
+                    voice += int(vals[1])
+                    active_days.add(date_key)
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if last_active is None or date_key > last_active:
+                last_active = date_key
+        # include unflushed buffer
+        for date_key, day_data in self._act_buf.get(guild.id, {}).items():
+            vals = day_data.get(uid)
+            if vals and date_key >= cutoff:
+                msgs += vals[0]
+                voice += vals[1]
+                active_days.add(date_key)
+                if last_active is None or date_key > last_active:
+                    last_active = date_key
+
+        vs = member.voice
+        in_voice = vs.channel.mention if vs and vs.channel else "No"
+
+        header = f"# Activity — {member.display_name}"
+        section = (
+            f"> **Member:** {member.mention}\n"
+            f"> **Window:** last {days} days\n"
+            f"> **Messages:** {msgs}\n"
+            f"> **Voice time:** {self._fmt_duration(voice)}\n"
+            f"> **Active days:** {len(active_days)}\n"
+            f"> **Last active:** {last_active or 'never recorded'}\n"
+            f"> **In voice now:** {in_voice}"
+        )
+        await self._send_paginated(dest, [section], header=header)
+
+    async def _voice_now_report(self, dest, guild: discord.Guild):
+        """Live snapshot of who is in voice right now."""
+        sections = []
+        total = 0
+        for ch in guild.voice_channels:
+            members = [m for m in ch.members if not m.bot]
+            if not members:
+                continue
+            total += len(members)
+            suffix = " *(AFK — not counted)*" if ch == guild.afk_channel else ""
+            lines = [f"{i}. {m.mention} ({m.display_name})" for i, m in enumerate(members, 1)]
+            sections.append(f"## 🔊 {ch.name} — {len(members)}{suffix}\n" + "\n".join(lines))
+
+        header = f"# In Voice Right Now\n**Total:** {total}"
+        if not sections:
+            sections.append("## Channels\n> Nobody is in voice right now.")
+        await self._send_paginated(dest, sections, header=header)
+
+    # ========== Hub (primary interface) ==========
+
+    async def _open_hub(self, ctx: commands.Context):
+        content, view = await self._build_hub(ctx.guild, ctx.author.id, "main", prefix=ctx.clean_prefix)
+        await ctx.send(content, view=view, allowed_mentions=discord.AllowedMentions.none())
+        await self.log_info(f"{ctx.author} opened the hub in guild {ctx.guild.id}")
+
+    async def _build_hub(self, guild: discord.Guild, invoker_id: int, mode: str, prefix: str = "[p]"):
+        """Build the hub message content + view for a mode.
+
+        The hub is one message that swaps its content/components as you
+        navigate, mirroring the event wizard's control panel pattern.
+        """
+        outer = self
+
+        class HubView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=900)
+                self.sel_event_name: Optional[str] = None
+
+            async def _check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != invoker_id:
+                    try:
+                        await inter.response.send_message(
+                            f"Only the person who opened this menu can use it. Run `{prefix}do` to get your own.",
+                            ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+                    return False
+                return True
+
+        view = HubView()
+
+        def add_nav(label: str, target_mode: str, *, style=discord.ButtonStyle.secondary, emoji=None):
+            btn = discord.ui.Button(label=label, style=style, emoji=emoji)
+
+            async def cb(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                content2, view2 = await outer._build_hub(guild, invoker_id, target_mode, prefix=prefix)
+                await inter.response.edit_message(content=content2, view=view2)
+
+            btn.callback = cb
+            view.add_item(btn)
+            return btn
+
+        def add_report_button(label: str, runner, *, style=discord.ButtonStyle.secondary, emoji=None):
+            """Button that acknowledges silently, then posts a report in the channel."""
+            btn = discord.ui.Button(label=label, style=style, emoji=emoji)
+
+            async def cb(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
+                try:
+                    await runner(inter)
+                except Exception as e:
+                    await outer.log_info(f"hub action {label!r} failed: guild={guild.id} err={e!r}")
+                    await outer._send_ephemeral(inter, "Something went wrong running that action.")
+
+            btn.callback = cb
+            view.add_item(btn)
+            return btn
+
+        # ---- main ----
+        if mode == "main":
+            content = (
+                "# DiscoOps\n"
+                "Server ops hub — pick a section:\n\n"
+                "> 📅 **Events** — scheduled events, attendee roles, detailed event posts\n"
+                "> 👥 **Members** — recent joins, members by role\n"
+                "> 📊 **Activity** — engagement stats for text and voice\n\n"
+                f"-# Everything here also exists as text commands — `{prefix}do help`."
+            )
+            add_nav("Events", "events", style=discord.ButtonStyle.primary, emoji="📅")
+            add_nav("Members", "members", style=discord.ButtonStyle.primary, emoji="👥")
+            add_nav("Activity", "activity", style=discord.ButtonStyle.primary, emoji="📊")
+
+            close_btn = discord.ui.Button(label="Close", style=discord.ButtonStyle.danger)
+
+            async def on_close(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                try:
+                    await inter.response.defer()
+                    if inter.message:
+                        await inter.message.delete()
+                except Exception:
+                    pass
+
+            close_btn.callback = on_close
+            view.add_item(close_btn)
+            return content, view
+
+        # ---- events ----
+        if mode == "events":
+            events = await self._get_scheduled_events(guild, with_counts=False)
+            content = (
+                "# DiscoOps — Events\n"
+                f"**Scheduled events:** {len(events)}\n\n"
+                "Pick an event, then use the buttons: **Details** shows the summary and "
+                "interested members; the **Role** buttons manage an attendee role for it.\n"
+                "**New Event Post** starts the detailed post wizard."
+            )
+
+            if events:
+                opts = []
+                for ev in events[:25]:
+                    label = (ev.name or "Untitled")[:100]
+                    starts = ev.start_time.strftime("%Y-%m-%d %H:%M") if ev.start_time else "TBD"
+                    opts.append(discord.SelectOption(label=label, description=starts[:100], value=str(ev.id)))
+                ev_select = discord.ui.Select(placeholder="Pick an event…", options=opts, min_values=1, max_values=1)
+                names_by_id = {str(ev.id): (ev.name or "Untitled") for ev in events}
+
+                async def on_pick(inter: discord.Interaction):
+                    if not await view._check(inter):
+                        return
+                    view.sel_event_name = names_by_id.get(ev_select.values[0])
+                    for o in ev_select.options:
+                        o.default = o.value == ev_select.values[0]
+                    await inter.response.edit_message(
+                        content=content + f"\n\n**Selected:** {view.sel_event_name}",
+                        view=view,
+                    )
+
+                ev_select.callback = on_pick
+                view.add_item(ev_select)
+
+            def needs_event(runner):
+                async def wrapped(inter: discord.Interaction):
+                    if not view.sel_event_name:
+                        return await outer._send_ephemeral(inter, "Pick an event from the dropdown first.")
+                    await runner(inter)
+                return wrapped
+
+            add_report_button(
+                "Details", needs_event(
+                    lambda inter: outer._event_info_with_members(inter.channel, guild, view.sel_event_name)
+                ),
+                style=discord.ButtonStyle.primary,
+            )
+            add_report_button(
+                "Role: Create", needs_event(
+                    lambda inter: outer._event_role_action(inter.channel, guild, inter.user, "create", view.sel_event_name, False)
+                ),
+            )
+            add_report_button(
+                "Role: Sync", needs_event(
+                    lambda inter: outer._event_role_action(inter.channel, guild, inter.user, "sync", view.sel_event_name, False)
+                ),
+            )
+            add_report_button(
+                "Role: Delete", needs_event(
+                    lambda inter: outer._event_role_action(inter.channel, guild, inter.user, "delete", view.sel_event_name, False)
+                ),
+            )
+            add_report_button(
+                "List All", lambda inter: outer._event_list_report(inter.channel, guild),
+            )
+            add_report_button(
+                "New Event Post",
+                lambda inter: outer._open_scheduled_event_picker(inter.channel, guild, inter.user.id, inter.channel.id),
+                style=discord.ButtonStyle.success,
+                emoji="📝",
+            )
+            add_nav("Back", "main")
+            return content, view
+
+        # ---- members ----
+        if mode == "members":
+            content = (
+                "# DiscoOps — Members\n"
+                "> **New Joins…** — list members who joined recently\n"
+                "> Or pick a role below to list everyone holding it."
+            )
+
+            role_select = discord.ui.RoleSelect(placeholder="Members with role…", min_values=1, max_values=1)
+
+            async def on_role(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                role = role_select.values[0]
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
+                await outer.log_info(f"{inter.user} listed members with role {role.id} via hub in guild {guild.id}")
+                await outer._members_role_report(inter.channel, role)
+
+            role_select.callback = on_role
+            view.add_item(role_select)
+
+            joins_btn = discord.ui.Button(label="New Joins…", style=discord.ButtonStyle.primary, emoji="🆕")
+
+            async def on_joins(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+
+                class NewJoinsModal(discord.ui.Modal, title="New Joins Report"):
+                    amount = discord.ui.TextInput(label="Amount", placeholder="7", max_length=4)
+                    period = discord.ui.TextInput(
+                        label="Period (days / weeks / months)", placeholder="days", max_length=10
+                    )
+
+                    async def on_submit(self, m_inter: discord.Interaction):
+                        try:
+                            amt = max(1, int(str(self.amount.value).strip()))
+                        except ValueError:
+                            return await outer._send_ephemeral(m_inter, "Amount must be a number, e.g. `7`.")
+                        try:
+                            await m_inter.response.defer()
+                        except Exception:
+                            pass
+                        await outer._members_new_report(m_inter.channel, guild, amt, str(self.period.value).strip())
+
+                await inter.response.send_modal(NewJoinsModal())
+
+            joins_btn.callback = on_joins
+            view.add_item(joins_btn)
+            add_nav("Back", "main")
+            return content, view
+
+        # ---- activity ----
+        if mode == "activity":
+            enabled = await self._activity_enabled(guild)
+            content = (
+                "# DiscoOps — Activity\n"
+                f"**Tracking:** {'ON' if enabled else 'OFF'} — message counts and voice time, no content stored.\n\n"
+                "> **Overview** — 7-day engagement summary\n"
+                "> **Top Members** — 30-day leaderboards\n"
+                "> **Voice Now** — who is in voice right now\n"
+                "> Or pick a member below for their individual stats."
+            )
+
+            user_select = discord.ui.UserSelect(placeholder="Member stats…", min_values=1, max_values=1)
+
+            async def on_user(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                target = user_select.values[0]
+                member = target if isinstance(target, discord.Member) else guild.get_member(target.id)
+                if member is None:
+                    return await outer._send_ephemeral(inter, "That user isn't in this server.")
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
+                await outer._activity_user_report(inter.channel, guild, member)
+
+            user_select.callback = on_user
+            view.add_item(user_select)
+
+            add_report_button(
+                "Overview", lambda inter: outer._activity_overview_report(inter.channel, guild, days=7),
+                style=discord.ButtonStyle.primary, emoji="📈",
+            )
+            add_report_button(
+                "Top Members", lambda inter: outer._activity_top_report(inter.channel, guild, days=30),
+                emoji="🏆",
+            )
+            add_report_button(
+                "Voice Now", lambda inter: outer._voice_now_report(inter.channel, guild),
+                emoji="🔊",
+            )
+
+            toggle_btn = discord.ui.Button(
+                label=f"Tracking: {'ON' if enabled else 'OFF'}",
+                style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger,
+            )
+
+            async def on_toggle(inter: discord.Interaction):
+                if not await view._check(inter):
+                    return
+                new_val = not await outer._activity_enabled(guild)
+                await outer.config.guild(guild).activity_enabled.set(new_val)
+                outer._act_enabled_cache[guild.id] = new_val
+                if not new_val:
+                    for key in [k for k in outer._voice_joined if k[0] == guild.id]:
+                        outer._voice_joined.pop(key, None)
+                await outer.log_info(f"{inter.user} set activity tracking to {new_val} in guild {guild.id}")
+                content2, view2 = await outer._build_hub(guild, invoker_id, "activity", prefix=prefix)
+                await inter.response.edit_message(content=content2, view=view2)
+
+            toggle_btn.callback = on_toggle
+            view.add_item(toggle_btn)
+            add_nav("Back", "main")
+            return content, view
+
+        # Fallback: main menu
+        return await self._build_hub(guild, invoker_id, "main", prefix=prefix)
+
     # ============= Command Group =============
 
     @commands.group(name="do", aliases=["discoops"])
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def discoops(self, ctx):
-        """DiscoOps main command group."""
+        """DiscoOps main command group. Bare `[p]do` opens the interactive hub."""
         if ctx.invoked_subcommand is None:
-            await ctx.send_help(ctx.command)
+            await self._open_hub(ctx)
 
     # ========== Members Commands ==========
 
@@ -1751,10 +2365,13 @@ class DiscoOps(commands.Cog):
         Example: [p]do members new 7 days
         """
         await self.log_info(f"{ctx.author} invoked 'members new' with amount={amount}, period={period} in guild {ctx.guild.id}")
+        await self._members_new_report(ctx, ctx.guild, amount, period)
 
+    async def _members_new_report(self, dest, guild: discord.Guild, amount: int, period: str):
+        """Core report for recent joins; `dest` needs .send and .typing."""
         period_l = (period or "").lower()
         if period_l not in ("days", "day", "weeks", "week", "months", "month"):
-            await ctx.send(
+            await dest.send(
                 "Period must be 'days', 'weeks', or 'months'",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1773,12 +2390,12 @@ class DiscoOps(commands.Cog):
         # Access members (requires Server Members Intent); chunking a large
         # guild can take a while, so show a typing indicator meanwhile.
         try:
-            async with ctx.typing():
-                members = list(ctx.guild.members)
+            async with dest.typing():
+                members = list(guild.members)
                 if not members:
                     try:
-                        await ctx.guild.chunk()
-                        members = list(ctx.guild.members)
+                        await guild.chunk()
+                        members = list(guild.members)
                     except discord.HTTPException:
                         # Chunking failed, continue with empty list
                         pass
@@ -1792,7 +2409,7 @@ class DiscoOps(commands.Cog):
             await self.log_info(f"Forbidden error accessing guild members: {e}")
 
         if not members:
-            await ctx.send(
+            await dest.send(
                 "I couldn't access the member list. Ensure **Server Members Intent** is enabled and the bot has cached members.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1812,7 +2429,7 @@ class DiscoOps(commands.Cog):
                     recent.append((m, ja))
         except Exception as e:
             await self.log_info(f"Error filtering recent members: {e}")
-            await ctx.send(
+            await dest.send(
                 "An error occurred while reading member join dates.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1821,7 +2438,7 @@ class DiscoOps(commands.Cog):
         recent.sort(key=lambda tup: tup[1], reverse=True)
 
         if not recent:
-            await ctx.send(
+            await dest.send(
                 f"ℹ️ No members joined in the last {amount} {period_l}.\n\n"
                 f"**Note:** Make sure the bot has been running and has cached member data. "
                 f"Members who joined before the bot was added won't be tracked.",
@@ -1843,13 +2460,17 @@ class DiscoOps(commands.Cog):
             )
             sections.append(block)
 
-        await self._send_paginated(ctx, sections, header=header)
+        await self._send_paginated(dest, sections, header=header)
         await self.log_info(f"Sent recent members list ({len(recent)} found)")
 
     @members_group.command(name="role")
     async def members_role(self, ctx, *, role: discord.Role):
         """List all members with a specific role and show count."""
         await self.log_info(f"{ctx.author} invoked 'members role' for role {role.id} in guild {ctx.guild.id}")
+        await self._members_role_report(ctx, role)
+
+    async def _members_role_report(self, dest, role: discord.Role):
+        """Core report for members holding a role; `dest` needs .send."""
         members_with_role = role.members
 
         header = f"# Members with role\n**Role:** `{role.name}`  •  **Total:** {len(members_with_role)}"
@@ -1874,8 +2495,56 @@ class DiscoOps(commands.Cog):
         )
         sections.append(role_info)
 
-        await self._send_paginated(ctx, sections, header=header)
+        await self._send_paginated(dest, sections, header=header)
         await self.log_info(f"Sent members-with-role list ({len(members_with_role)} members)")
+
+    # ========== Activity Commands ==========
+
+    @discoops.group(name="activity", aliases=["act"], invoke_without_command=True)
+    async def activity_group(self, ctx):
+        """
+        Server activity tracking (message counts + voice time; no content stored).
+
+        - `[p]do activity` — 7-day overview
+        - `[p]do activity top [days]` — leaderboards
+        - `[p]do activity user <member> [days]` — one member's stats
+        - `[p]do activity voice` — who is in voice right now
+        - `[p]do activity toggle` — enable/disable tracking
+        """
+        if ctx.invoked_subcommand is None:
+            await self._activity_overview_report(ctx, ctx.guild, days=7)
+
+    @activity_group.command(name="top")
+    async def activity_top(self, ctx, days: Optional[int] = 7, count: Optional[int] = 10):
+        """Most active members over the last N days (default 7)."""
+        await self._activity_top_report(ctx, ctx.guild, days=days or 7, count=count or 10)
+
+    @activity_group.command(name="user")
+    async def activity_user(self, ctx, member: discord.Member, days: Optional[int] = 30):
+        """Activity stats for one member (default window: 30 days)."""
+        await self._activity_user_report(ctx, ctx.guild, member, days=days or 30)
+
+    @activity_group.command(name="voice")
+    async def activity_voice(self, ctx):
+        """Show who is in a voice channel right now."""
+        await self._voice_now_report(ctx, ctx.guild)
+
+    @activity_group.command(name="toggle")
+    async def activity_toggle(self, ctx):
+        """Enable or disable activity tracking for this server."""
+        current = await self.config.guild(ctx.guild).activity_enabled()
+        new_val = not current
+        await self.config.guild(ctx.guild).activity_enabled.set(new_val)
+        self._act_enabled_cache[ctx.guild.id] = new_val
+        if not new_val:
+            # Stop open voice sessions; don't credit further time while disabled.
+            for key in [k for k in self._voice_joined if k[0] == ctx.guild.id]:
+                self._voice_joined.pop(key, None)
+        await ctx.send(
+            f"Activity tracking is now **{'ON' if new_val else 'OFF'}** for this server.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self.log_info(f"{ctx.author} set activity tracking to {new_val} in guild {ctx.guild.id}")
 
     # ========== Event Commands (Using Discord's Scheduled Events) ==========
 
@@ -1890,7 +2559,7 @@ class DiscoOps(commands.Cog):
         - `[p]do event create` — start the detailed event wizard
         """
         if event_name:
-            await self._event_info_with_members(ctx, event_name)
+            await self._event_info_with_members(ctx, ctx.guild, event_name)
         else:
             await ctx.send_help(ctx.command)
 
@@ -1909,7 +2578,7 @@ class DiscoOps(commands.Cog):
         Usage: [p]do event create
         """
         await self.log_info(f"{ctx.author} started event wizard in guild {ctx.guild.id}")
-        await self._open_scheduled_event_picker(ctx)
+        await self._open_scheduled_event_picker(ctx, ctx.guild, ctx.author.id, ctx.channel.id)
 
     @event_group.group(name="wizard", invoke_without_command=True)
     async def event_wizard_group(self, ctx: commands.Context):
@@ -2101,10 +2770,15 @@ class DiscoOps(commands.Cog):
     @event_group.command(name="list", aliases=["ls"])
     async def event_list(self, ctx):
         """List scheduled events as normal messages (no embed), with pagination."""
-        async with ctx.typing():
-            events = await self._get_scheduled_events(ctx.guild, with_counts=True)
+        await self._event_list_report(ctx, ctx.guild)
+        await self.log_info(f"{ctx.author} listed events (plain messages) in guild {ctx.guild.id}")
+
+    async def _event_list_report(self, dest, guild: discord.Guild):
+        """Core scheduled-events listing; `dest` needs .send and .typing."""
+        async with dest.typing():
+            events = await self._get_scheduled_events(guild, with_counts=True)
         if not events:
-            await ctx.send(
+            await dest.send(
                 "No scheduled events found in this server.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -2157,8 +2831,7 @@ class DiscoOps(commands.Cog):
             )
             sections.append(section)
 
-        await self._send_paginated(ctx, sections, header=header)
-        await self.log_info(f"{ctx.author} listed events (plain messages) in guild {ctx.guild.id}")
+        await self._send_paginated(dest, sections, header=header)
 
     @event_group.command(name="members")  # deprecated path, kept for compatibility
     async def event_members_legacy(self, ctx, *, event_name: str):
@@ -2167,15 +2840,15 @@ class DiscoOps(commands.Cog):
             "`members` is deprecated. Use: `[p]do event \"Event Name\"`.\nShowing the info below:",
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        await self._event_info_with_members(ctx, event_name)
+        await self._event_info_with_members(ctx, ctx.guild, event_name)
 
-    async def _event_info_with_members(self, ctx, event_name: str):
+    async def _event_info_with_members(self, dest, guild: discord.Guild, event_name: str):
         """Show one event summary + interested members as plain messages (auto-paginated)."""
-        async with ctx.typing():
-            events = await self._get_scheduled_events(ctx.guild, with_counts=True)
+        async with dest.typing():
+            events = await self._get_scheduled_events(guild, with_counts=True)
             event = self._event_match(events, event_name)
         if not event:
-            await ctx.send(
+            await dest.send(
                 f"❌ **Event Not Found:** '{event_name}'\n\n"
                 f"**Tip:** Use `[p]do event list` to see all scheduled events, then copy the exact event name.\n"
                 f"**Note:** Event names are case-insensitive and support partial matches.",
@@ -2187,13 +2860,13 @@ class DiscoOps(commands.Cog):
         # Collect users (paged HTTP calls; keep the typing indicator going)
         interested_users = []
         try:
-            async with ctx.typing():
+            async with dest.typing():
                 async for user in event.users():
-                    member = ctx.guild.get_member(user.id)
+                    member = guild.get_member(user.id)
                     if member:
                         interested_users.append(member)
         except Exception as e:
-            await ctx.send(
+            await dest.send(
                 f"Error fetching interested users: {e}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -2254,8 +2927,8 @@ class DiscoOps(commands.Cog):
         else:
             sections.append("## Interested Members 0\n> None")
 
-        await self._send_paginated(ctx, sections, header=header)
-        await self.log_info(f"{ctx.author} viewed event info for {getattr(event, 'id', 'unknown')} in guild {ctx.guild.id}")
+        await self._send_paginated(dest, sections, header=header)
+        await self.log_info(f"event info viewed for {getattr(event, 'id', 'unknown')} in guild {guild.id}")
 
     @event_group.command(name="role")
     async def event_role(self, ctx, action: str, *, event_name: str):
@@ -2282,11 +2955,18 @@ class DiscoOps(commands.Cog):
             )
             return
 
-        async with ctx.typing():
-            events = await self._get_scheduled_events(ctx.guild, with_counts=True)
+        await self._event_role_action(ctx, ctx.guild, ctx.author, action_l, event_name, ping)
+
+    async def _event_role_action(self, dest, guild: discord.Guild, author, action_l: str, event_name: str, ping: bool):
+        """Create/sync/delete an attendee role for a scheduled event.
+
+        `dest` needs .send and .typing; callable from prefix command or hub.
+        """
+        async with dest.typing():
+            events = await self._get_scheduled_events(guild, with_counts=True)
             event = self._event_match(events, event_name)
         if not event:
-            await ctx.send(
+            await dest.send(
                 f"❌ **Event Not Found:** '{event_name}'\n\n"
                 f"**Tip:** Use `[p]do event list` to see all scheduled events, then copy the exact event name.\n"
                 f"**Note:** Event names are case-insensitive and support partial matches.",
@@ -2298,32 +2978,32 @@ class DiscoOps(commands.Cog):
         # Interested users
         interested_users = []
         try:
-            async with ctx.typing():
+            async with dest.typing():
                 async for user in event.users():
-                    member = ctx.guild.get_member(user.id)
+                    member = guild.get_member(user.id)
                     if member:
                         interested_users.append(member)
         except Exception as e:
-            await ctx.send(
+            await dest.send(
                 f"Error fetching interested users: {e}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             await self.log_info(f"Error fetching users for event {getattr(event, 'id', 'unknown')}: {e}")
             return
 
-        event_roles = await self.config.guild(ctx.guild).event_roles()
+        event_roles = await self.config.guild(guild).event_roles()
         event_id_str = str(getattr(event, "id", "0"))
 
         if action_l == "create":
             if event_id_str in event_roles:
-                role = ctx.guild.get_role(event_roles[event_id_str])
+                role = guild.get_role(event_roles[event_id_str])
                 if role:
-                    await ctx.send(
+                    await dest.send(
                         f"Role already exists: {role.mention}",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     if ping:
-                        await ctx.send(
+                        await dest.send(
                             role.mention,
                             allowed_mentions=discord.AllowedMentions(
                                 roles=True, users=False, everyone=False, replied_user=False
@@ -2331,64 +3011,64 @@ class DiscoOps(commands.Cog):
                         )
                     return
             try:
-                role = await ctx.guild.create_role(
+                role = await guild.create_role(
                     name=f"Event: {getattr(event, 'name', 'Event')}",
                     color=discord.Color.random(),
                     mentionable=True,
-                    reason=f"Event role created by {ctx.author}"
+                    reason=f"Event role created by {author}"
                 )
-                async with self.config.guild(ctx.guild).event_roles() as roles:
+                async with self.config.guild(guild).event_roles() as roles:
                     roles[event_id_str] = role.id
                 
                 # Check role hierarchy before attempting to assign
                 # Bot can only manage roles strictly below its highest role
-                if ctx.guild.me.top_role <= role:
+                if guild.me.top_role <= role:
                     # Delete the unusable role
                     try:
                         await role.delete(reason="Role hierarchy issue - bot cannot manage this role")
                     except discord.Forbidden:
                         pass
                     # Remove from config
-                    async with self.config.guild(ctx.guild).event_roles() as roles:
+                    async with self.config.guild(guild).event_roles() as roles:
                         if event_id_str in roles:
                             del roles[event_id_str]
-                    await ctx.send(
+                    await dest.send(
                         f"❌ **Role Hierarchy Issue**\n"
                         f"The created role would be at or above my highest role, which prevents me from managing it.\n"
                         f"Role has been deleted.\n\n"
                         f"**To fix:** Go to Server Settings → Roles and drag my role higher, then try again.",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-                    await self.log_info(f"Role hierarchy issue: bot role {ctx.guild.me.top_role.name} below event role - deleted role")
+                    await self.log_info(f"Role hierarchy issue: bot role {guild.me.top_role.name} below event role - deleted role")
                     return
                 
                 if len(interested_users) > 10:
-                    await ctx.send(
+                    await dest.send(
                         f"Assigning {role.mention} to {len(interested_users)} interested members — this can take a while (Discord rate limits)…",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 added = 0
-                async with ctx.typing():
+                async with dest.typing():
                     for member in interested_users:
                         try:
-                            await member.add_roles(role, reason=f"Event role created by {ctx.author}")
+                            await member.add_roles(role, reason=f"Event role created by {author}")
                             added += 1
                         except discord.Forbidden:
                             pass
-                await ctx.send(
+                await dest.send(
                     f"Created role {role.mention} and added to {added} interested members",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 if ping:
-                    await ctx.send(
+                    await dest.send(
                         role.mention,
                         allowed_mentions=discord.AllowedMentions(
                             roles=True, users=False, everyone=False, replied_user=False
                         ),
                     )
-                await self.log_info(f"Created role {role.id} for event {event_id_str} in guild {ctx.guild.id}")
+                await self.log_info(f"Created role {role.id} for event {event_id_str} in guild {guild.id}")
             except discord.Forbidden:
-                await ctx.send(
+                await dest.send(
                     "❌ **Permission Error**\n"
                     "I don't have permission to create roles.\n\n"
                     "**Required Permission:** Manage Roles\n"
@@ -2399,18 +3079,18 @@ class DiscoOps(commands.Cog):
 
         elif action_l == "sync":
             if event_id_str not in event_roles:
-                await ctx.send(
+                await dest.send(
                     f"No role exists for event **{getattr(event, 'name', 'Event')}**. Use `create` first.",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
-            role = ctx.guild.get_role(event_roles[event_id_str])
+            role = guild.get_role(event_roles[event_id_str])
             if not role:
-                await ctx.send(
+                await dest.send(
                     f"Role no longer exists for event **{getattr(event, 'name', 'Event')}**",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-                async with self.config.guild(ctx.guild).event_roles() as roles:
+                async with self.config.guild(guild).event_roles() as roles:
                     if event_id_str in roles:
                         del roles[event_id_str]
                 return
@@ -2422,14 +3102,14 @@ class DiscoOps(commands.Cog):
             to_remove = current_members - interested_member_ids
 
             if len(to_add) + len(to_remove) > 10:
-                await ctx.send(
+                await dest.send(
                     f"Syncing {role.mention}: {len(to_add)} to add, {len(to_remove)} to remove — this can take a while (Discord rate limits)…",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             added = removed = 0
-            async with ctx.typing():
+            async with dest.typing():
                 for member_id in to_add:
-                    member = ctx.guild.get_member(member_id)
+                    member = guild.get_member(member_id)
                     if member:
                         try:
                             await member.add_roles(role, reason="Event role sync")
@@ -2437,7 +3117,7 @@ class DiscoOps(commands.Cog):
                         except discord.Forbidden:
                             pass
                 for member_id in to_remove:
-                    member = ctx.guild.get_member(member_id)
+                    member = guild.get_member(member_id)
                     if member:
                         try:
                             await member.remove_roles(role, reason="Event role sync")
@@ -2445,44 +3125,44 @@ class DiscoOps(commands.Cog):
                         except discord.Forbidden:
                             pass
 
-            await ctx.send(
+            await dest.send(
                 f"Sync complete for {role.mention} — Added: {added} • Removed: {removed}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             if ping:
-                await ctx.send(
+                await dest.send(
                     role.mention,
                     allowed_mentions=discord.AllowedMentions(
                         roles=True, users=False, everyone=False, replied_user=False
                     ),
                 )
-            await self.log_info(f"Synced role {role.id} for event {event_id_str} in guild {ctx.guild.id}: +{added}/-{removed}")
+            await self.log_info(f"Synced role {role.id} for event {event_id_str} in guild {guild.id}: +{added}/-{removed}")
 
         elif action_l == "delete":
             if event_id_str not in event_roles:
-                await ctx.send(
+                await dest.send(
                     f"No role exists for event **{getattr(event, 'name', 'Event')}**",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
-            role = ctx.guild.get_role(event_roles[event_id_str])
+            role = guild.get_role(event_roles[event_id_str])
             if role:
                 try:
-                    await role.delete(reason=f"Event role deleted by {ctx.author}")
-                    await ctx.send(
+                    await role.delete(reason=f"Event role deleted by {author}")
+                    await dest.send(
                         f"Deleted role for event **{getattr(event, 'name', 'Event')}**",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except discord.Forbidden:
-                    await ctx.send(
+                    await dest.send(
                         "I don't have permission to delete this role.",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
-            async with self.config.guild(ctx.guild).event_roles() as roles:
+            async with self.config.guild(guild).event_roles() as roles:
                 if event_id_str in roles:
                     del roles[event_id_str]
-            await self.log_info(f"Deleted role for event {event_id_str} in guild {ctx.guild.id}")
+            await self.log_info(f"Deleted role for event {event_id_str} in guild {guild.id}")
 
     # ========== Debug / Logs (Owner Only) ==========
 
@@ -2562,6 +3242,7 @@ class DiscoOps(commands.Cog):
         """Show detailed help for DiscoOps commands."""
         help_md = (
             "# DiscoOps Help\n"
+            "`[p]do` — Open the interactive hub (all features via buttons)\n\n"
             "## Members\n"
             "`[p]do members new <amount> <days|weeks|months>` — List recent joins\n"
             "`[p]do members role <@role>` — List members with a role\n\n"
@@ -2569,7 +3250,13 @@ class DiscoOps(commands.Cog):
             "`[p]do event list` — List scheduled events (plain messages, paginated)\n"
             "`[p]do event \"Event Name\"` — Show one event (+ members)\n"
             "`[p]do event role <create|sync|delete> \"Event Name\" [--ping]` — Manage event role\n"
-            "`[p]do event create` — Start the detailed event wizard\n"
+            "`[p]do event create` — Start the detailed event wizard\n\n"
+            "## Activity\n"
+            "`[p]do activity` — 7-day engagement overview (text + voice)\n"
+            "`[p]do activity top [days]` — Most active members\n"
+            "`[p]do activity user <@member> [days]` — One member's stats\n"
+            "`[p]do activity voice` — Who is in voice right now\n"
+            "`[p]do activity toggle` — Enable/disable tracking\n"
         )
         await self._send_paginated(ctx, [help_md])
 

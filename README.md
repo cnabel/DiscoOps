@@ -28,6 +28,12 @@ Replace `[p]` with your bot's prefix.
 
 Base command: `[p]do` (alias: `[p]discoops`).
 
+### The Hub
+
+Running `[p]do` with no arguments opens the interactive hub — a button menu
+that reaches every feature (Events, Members, Activity) without memorizing
+subcommands. Text subcommands below still work and do the same things.
+
 Members:
 ```text
 [p]do members new 7 days
@@ -64,6 +70,20 @@ This opens an interactive wizard to create rich event posts with:
 - Optional calendar sync (edits flow back to the scheduled event)
 - Automatic discussion thread creation
 
+Server activity tracking:
+```text
+[p]do activity            # 7-day engagement overview
+[p]do activity top 30     # leaderboards (messages + voice time)
+[p]do activity user @Name # one member's stats
+[p]do activity voice      # who is in voice right now
+[p]do activity toggle     # turn tracking on/off
+```
+
+Tracking stores per-member daily counters only (message counts and voice
+seconds) — never message content. Counters are buffered in memory and
+flushed to disk once a minute; data is kept for 35 days. Time in the AFK
+channel is not counted.
+
 ## Permissions
 
 User (running commands):
@@ -72,6 +92,8 @@ User (running commands):
 Bot:
 - Server Members Intent: required for member join listings
 - Manage Roles: only required for event role commands
+- Voice States + Message Content intents: required for activity tracking
+  (Red enables these by default; message *content* is never stored)
 
 ## Full Reference
 
