@@ -2077,14 +2077,29 @@ class DiscoOps(commands.Cog):
 
         view = HubView()
 
+        async def switch_mode(inter: discord.Interaction, target_mode: str):
+            """Ack first, then rebuild — building may involve HTTP calls
+            (e.g. fetching scheduled events), and the interaction must be
+            acknowledged within 3 seconds or Discord fails the click."""
+            try:
+                await inter.response.defer()
+            except Exception:
+                pass
+            try:
+                content2, view2 = await outer._build_hub(guild, invoker_id, target_mode, prefix=prefix)
+                if inter.message:
+                    await inter.message.edit(content=content2, view=view2)
+            except Exception as e:
+                await outer.log_info(f"hub switch to {target_mode!r} failed: guild={guild.id} err={e!r}")
+                await outer._send_ephemeral(inter, "Couldn't open that section — try again. (Details are in the bot logs.)")
+
         def add_nav(label: str, target_mode: str, *, style=discord.ButtonStyle.secondary, emoji=None):
             btn = discord.ui.Button(label=label, style=style, emoji=emoji)
 
             async def cb(inter: discord.Interaction):
                 if not await view._check(inter):
                     return
-                content2, view2 = await outer._build_hub(guild, invoker_id, target_mode, prefix=prefix)
-                await inter.response.edit_message(content=content2, view=view2)
+                await switch_mode(inter, target_mode)
 
             btn.callback = cb
             view.add_item(btn)
@@ -2219,8 +2234,8 @@ class DiscoOps(commands.Cog):
         if mode == "members":
             content = (
                 "# DiscoOps — Members\n"
-                "> **New Joins…** — list members who joined recently\n"
-                "> Or pick a role below to list everyone holding it."
+                "> **New joins** — pick a time range to list recent joins\n"
+                "> **Members with role** — pick a role to list everyone holding it"
             )
 
             role_select = discord.ui.RoleSelect(placeholder="Members with role…", min_values=1, max_values=1)
@@ -2239,33 +2254,54 @@ class DiscoOps(commands.Cog):
             role_select.callback = on_role
             view.add_item(role_select)
 
-            joins_btn = discord.ui.Button(label="New Joins…", style=discord.ButtonStyle.primary, emoji="🆕")
+            # Preset ranges as a dropdown. (Discord modals only allow text
+            # fields, so the dropdown lives in the view; Custom… opens the
+            # old form for anything not covered.)
+            joins_opts = [
+                discord.SelectOption(label="Last 24 hours", value="1:days", emoji="🆕"),
+                discord.SelectOption(label="Last 3 days", value="3:days"),
+                discord.SelectOption(label="Last 7 days", value="7:days"),
+                discord.SelectOption(label="Last 2 weeks", value="2:weeks"),
+                discord.SelectOption(label="Last 30 days", value="30:days"),
+                discord.SelectOption(label="Last 3 months", value="3:months"),
+                discord.SelectOption(label="Custom…", value="custom", description="Enter your own amount and period"),
+            ]
+            joins_select = discord.ui.Select(placeholder="New joins: pick a range…", options=joins_opts, min_values=1, max_values=1)
 
             async def on_joins(inter: discord.Interaction):
                 if not await view._check(inter):
                     return
+                choice = joins_select.values[0]
 
-                class NewJoinsModal(discord.ui.Modal, title="New Joins Report"):
-                    amount = discord.ui.TextInput(label="Amount", placeholder="7", max_length=4)
-                    period = discord.ui.TextInput(
-                        label="Period (days / weeks / months)", placeholder="days", max_length=10
-                    )
+                if choice == "custom":
+                    class NewJoinsModal(discord.ui.Modal, title="New Joins Report"):
+                        amount = discord.ui.TextInput(label="Amount", placeholder="7", max_length=4)
+                        period = discord.ui.TextInput(
+                            label="Period (days / weeks / months)", placeholder="days", max_length=10
+                        )
 
-                    async def on_submit(self, m_inter: discord.Interaction):
-                        try:
-                            amt = max(1, int(str(self.amount.value).strip()))
-                        except ValueError:
-                            return await outer._send_ephemeral(m_inter, "Amount must be a number, e.g. `7`.")
-                        try:
-                            await m_inter.response.defer()
-                        except Exception:
-                            pass
-                        await outer._members_new_report(m_inter.channel, guild, amt, str(self.period.value).strip())
+                        async def on_submit(self, m_inter: discord.Interaction):
+                            try:
+                                amt = max(1, int(str(self.amount.value).strip()))
+                            except ValueError:
+                                return await outer._send_ephemeral(m_inter, "Amount must be a number, e.g. `7`.")
+                            try:
+                                await m_inter.response.defer()
+                            except Exception:
+                                pass
+                            await outer._members_new_report(m_inter.channel, guild, amt, str(self.period.value).strip())
 
-                await inter.response.send_modal(NewJoinsModal())
+                    return await inter.response.send_modal(NewJoinsModal())
 
-            joins_btn.callback = on_joins
-            view.add_item(joins_btn)
+                amt_str, period = choice.split(":", 1)
+                try:
+                    await inter.response.defer()
+                except Exception:
+                    pass
+                await outer._members_new_report(inter.channel, guild, int(amt_str), period)
+
+            joins_select.callback = on_joins
+            view.add_item(joins_select)
             add_nav("Back", "main")
             return content, view
 
@@ -2327,8 +2363,7 @@ class DiscoOps(commands.Cog):
                     for key in [k for k in outer._voice_joined if k[0] == guild.id]:
                         outer._voice_joined.pop(key, None)
                 await outer.log_info(f"{inter.user} set activity tracking to {new_val} in guild {guild.id}")
-                content2, view2 = await outer._build_hub(guild, invoker_id, "activity", prefix=prefix)
-                await inter.response.edit_message(content=content2, view=view2)
+                await switch_mode(inter, "activity")
 
             toggle_btn.callback = on_toggle
             view.add_item(toggle_btn)
@@ -2340,7 +2375,9 @@ class DiscoOps(commands.Cog):
 
     # ============= Command Group =============
 
-    @commands.group(name="do", aliases=["discoops"])
+    # invoke_without_command=True stops Red's automatic help menu from being
+    # sent alongside the hub when `[p]do` is run bare.
+    @commands.group(name="do", aliases=["discoops"], invoke_without_command=True)
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def discoops(self, ctx):

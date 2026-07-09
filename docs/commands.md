@@ -52,8 +52,9 @@ Opens a single interactive menu message with three sections:
 - **Events** — pick a scheduled event from a dropdown, then view details or
   create/sync/delete its attendee role; list all events; start the detailed
   event post wizard.
-- **Members** — "New Joins…" opens a form (amount + period); a role dropdown
-  lists everyone holding the chosen role.
+- **Members** — a "New joins" dropdown with preset ranges (24 hours … 3
+  months, plus Custom… for a free-form amount/period); a role dropdown lists
+  everyone holding the chosen role.
 - **Activity** — engagement overview, leaderboards, live voice snapshot, a
   member dropdown for individual stats, and the tracking on/off toggle.
 
