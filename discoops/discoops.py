@@ -728,10 +728,8 @@ class DiscoOps(commands.Cog):
                     return
                 if not state.get("chan"):
                     return await inter.response.send_message("Pick a channel first.", ephemeral=True)
-                try:
-                    await inter.response.defer(thinking=True)
-                except Exception:
-                    pass
+                # Acknowledge quickly to avoid "This interaction failed".
+                await outer._defer_ephemeral(inter, thinking=True)
                 await outer._publish_to_channel(inter, draft, channel_id=int(state["chan"]))
 
             async def on_back(inter: discord.Interaction):
